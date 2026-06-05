@@ -1,0 +1,17 @@
+[package]
+name    = "echo-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quinn          = { workspace = true }
+rustls         = { workspace = true }
+tokio          = { workspace = true }
+thiserror      = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# Loopback test spins up echo-server in-process.
+echo-server = { path = "../echo-server" }
+rcgen       = { workspace = true }

@@ -1,0 +1,15 @@
+[workspace]
+members  = ["echo-server", "echo-client", "mls-demo"]
+resolver = "2"
+
+[workspace.dependencies]
+quinn                    = "=0.11.9"
+rustls                   = "=0.23.40"
+rustls-pemfile           = "=2.2.0"
+rcgen                    = "=0.14.8"
+tokio                    = { version = "=1.52.3", features = ["full"] }
+thiserror                = "=2.0.18"
+tracing                  = "=0.1.44"
+tracing-subscriber       = { version = "=0.3.23", features = ["env-filter"] }
+mls-rs                   = "=0.55.0"
+mls-rs-crypto-rustcrypto = "=0.22.0"
