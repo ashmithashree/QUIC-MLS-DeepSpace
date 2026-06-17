@@ -1,5 +1,5 @@
 [workspace]
-members  = ["echo-server", "echo-client", "mls-demo"]
+members  = ["echo-server", "echo-client", "mls-demo","quic-mls"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -13,3 +13,5 @@ tracing                  = "=0.1.44"
 tracing-subscriber       = { version = "=0.3.23", features = ["env-filter"] }
 mls-rs                   = "=0.55.0"
 mls-rs-crypto-rustcrypto = "=0.22.0"
+quinn-proto = "=0.11.14"
+bytes        = "=1.11.1"

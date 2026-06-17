@@ -1,0 +1,8 @@
+[package]
+name    = "quic-mls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quinn-proto = { workspace = true }
+bytes       = { workspace = true }
