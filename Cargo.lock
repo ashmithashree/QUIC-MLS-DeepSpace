@@ -1398,6 +1398,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "quic-mls"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "quinn-proto",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
