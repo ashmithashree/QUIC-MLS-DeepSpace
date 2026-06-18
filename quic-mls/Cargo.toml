@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 quinn-proto = { workspace = true }
 bytes       = { workspace = true }
+aes-gcm     = { workspace = true }
+aes         = { workspace = true }
+hkdf        = { workspace = true }
+sha2        = { workspace = true }

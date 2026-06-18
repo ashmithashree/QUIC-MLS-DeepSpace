@@ -1401,8 +1401,12 @@ dependencies = [
 name = "quic-mls"
 version = "0.1.0"
 dependencies = [
+ "aes",
+ "aes-gcm",
  "bytes",
+ "hkdf",
  "quinn-proto",
+ "sha2",
 ]
 
 [[package]]
