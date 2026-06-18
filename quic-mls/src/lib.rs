@@ -1,169 +1,35 @@
 use bytes::BytesMut;
 use quinn_proto::crypto::{CryptoError, HeaderKey, KeyPair, Keys, PacketKey};
 
-// ── Stub keys (replaced in Step 2) ───────────────────────────────────────────
-
-struct StubPacketKey;
-impl PacketKey for StubPacketKey {
-    fn encrypt(&self, _pn: u64, _buf: &mut [u8], _header_len: usize) {
-        unimplemented!("replace in step 2")
-    }
-    fn decrypt(
-        &self,
-        _pn: u64,
-        _header: &[u8],
-        _payload: &mut BytesMut,
-    ) -> Result<(), CryptoError> {
-        unimplemented!("replace in step 2")
-    }
-    fn tag_len(&self) -> usize { 16 }
-    fn confidentiality_limit(&self) -> u64 { u64::MAX }
-    fn integrity_limit(&self) -> u64 { u64::MAX }
-}
-
-struct StubHeaderKey;
-impl HeaderKey for StubHeaderKey {
-    fn decrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {
-        unimplemented!("replace in step 2")
-    }
-    fn encrypt(&self, _pn_offset: usize, _packet: &mut [u8]) {
-        unimplemented!("replace in step 2")
-    }
-    fn sample_size(&self) -> usize { 16 }
-}
-
-fn stub_keys() -> Keys {
-    Keys {
-        header: KeyPair {
-            local:  Box::new(StubHeaderKey),
-            remote: Box::new(StubHeaderKey),
-        },
-        packet: KeyPair {
-            local:  Box::new(StubPacketKey),
-            remote: Box::new(StubPacketKey),
-        },
-    }
-}
-
-// ── Handshake state ───────────────────────────────────────────────────────────
-
-use quinn_proto::Side;
-
-enum HsState {
-    Initial,         // write_handshake not yet called
-    SentHandshakeKeys, // returned Handshake Keys; waiting for 1-RTT call
-    Done,            // returned 1-RTT Keys; handshake complete
-}
-
-pub struct MlsSession {
-    side:  Side,
-    state: HsState,
-}
-
-impl MlsSession {
-    pub fn new(side: Side) -> Self {
-        Self { side, state: HsState::Initial }
-    }
-}
-
-// ── Session trait impl ────────────────────────────────────────────────────────
-
-use std::any::Any;
-use quinn_proto::{
-    crypto::{ExportKeyingMaterialError, Session},
-    transport_parameters::TransportParameters,
-    ConnectionId, TransportError,
-};
-
-impl Session for MlsSession {
-    // Initial keys must follow RFC 9001 §5.2 — not MLS-derived.
-    // Replaced in Step 2 with the standard QUIC Initial key schedule.
-    fn initial_keys(&self, _dst_cid: &ConnectionId, _side: Side) -> Keys {
-        stub_keys()
-    }
-
-    fn is_handshaking(&self) -> bool {
-        !matches!(self.state, HsState::Done)
-    }
-
-    // MLS group membership is the authentication — no TLS cert chain.
-    fn handshake_data(&self) -> Option<Box<dyn Any>> { None }
-    fn peer_identity(&self) -> Option<Box<dyn Any>> { None }
-
-    // 0-RTT not implemented in Phase 1.
-    fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> { None }
-    fn early_data_accepted(&self) -> Option<bool> { Some(false) }
-
-    // Step 3: decode the peer's TransportParameters from CRYPTO frames here.
-    fn read_handshake(&mut self, _buf: &[u8]) -> Result<bool, TransportError> {
-        Ok(false)
-    }
-
-    // Step 3: return Some(...) once TransportParameters are decoded.
-    fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
-        Ok(None)
-    }
-
-    // Step 2+3: write our TransportParameters into buf, then return
-    // MLS-derived Keys for the Handshake space, then 1-RTT space.
-    fn write_handshake(&mut self, _buf: &mut Vec<u8>) -> Option<Keys> {
-        None
-    }
-
-    // Step 4: advance the MLS epoch and derive new PacketKeys.
-    fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        None
-    }
-
-    // Retry-packet integrity: Step 2 delegates this to a standard impl.
-    fn is_valid_retry(
-        &self,
-        _orig_dst_cid: &ConnectionId,
-        _header: &[u8],
-        _payload: &[u8],
-    ) -> bool {
-        false
-    }
-
-    fn export_keying_material(
-        &self,
-        _output: &mut [u8],
-        _label: &[u8],
-        _context: &[u8],
-    ) -> Result<(), ExportKeyingMaterialError> {
-        Err(ExportKeyingMaterialError)
-    }
-}
 
 // ── RFC 9001 / TLS 1.3 HKDF-Expand-Label ─────────────────────────────────────
 
 use hkdf::Hkdf;
 use sha2::Sha256;
-
-/// Turns one secret into len bytes of new key material, labeled so that
-/// "quic key", "quic iv", and "quic hp" each produce an independent output
-/// from the same input secret. secret is treated as an HKDF PRK (it is
-/// itself already the output of a previous derivation step, e.g.
-/// `export_secret`), so this only runs the HKDF-Expand half, never Extract.
-fn hkdf_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Vec<u8> {
-    // TLS 1.3 prefixes every label with "tls13 " (RFC 8446 7.1); QUIC reuses
-    // this format unchanged (RFC 9001 5.1).
+const INITIAL_SALT: [u8; 20] = [
+    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8,
+    0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a,
+];
+fn hkdf_label_info(label: &str, context: &[u8], len: usize) -> Vec<u8> {
     let full_label = format!("tls13 {label}");
-
-    // Wire format of HkdfLabel: u16 length, then a length-prefixed label,
-    // then a length-prefixed context (empty for QUIC key derivation).
     let mut info = Vec::with_capacity(2 + 1 + full_label.len() + 1 + context.len());
     info.extend_from_slice(&(len as u16).to_be_bytes());
     info.push(full_label.len() as u8);
     info.extend_from_slice(full_label.as_bytes());
     info.push(context.len() as u8);
     info.extend_from_slice(context);
+    info
+}
 
+
+fn hkdf_expand_label(secret: &[u8], label: &str, context: &[u8], len: usize) -> Vec<u8> {
+    let info = hkdf_label_info(label, context, len);
     let hkdf = Hkdf::<Sha256>::from_prk(secret).expect("secret is a valid 32-byte PRK");
     let mut okm = vec![0u8; len];
     hkdf.expand(&info, &mut okm).expect("len is far below HKDF's 255*32-byte max");
     okm
 }
+
 
 #[cfg(test)]
 mod hkdf_tests {
@@ -373,3 +239,128 @@ fn same_secret_reproduces_identical_key_different_secret_does_not() {
     let (client_packet_again, _) = derive_keys_from_secret(&client_secret);
     assert_eq!(client_packet, client_packet_again);
 }
+fn derive_initial_secrets(dst_cid: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    // Hkdf::new runs Extract(salt, dst_cid) and keeps the resulting PRK
+    // internally, ready for repeated Expand calls below.
+    let hkdf = Hkdf::<Sha256>::new(Some(&INITIAL_SALT), dst_cid);
+
+    let mut client_secret = vec![0u8; 32];
+    hkdf.expand(&hkdf_label_info("client in", b"", 32), &mut client_secret)
+        .expect("32 bytes is within HKDF's max output");
+
+    let mut server_secret = vec![0u8; 32];
+    hkdf.expand(&hkdf_label_info("server in", b"", 32), &mut server_secret)
+        .expect("32 bytes is within HKDF's max output");
+
+    (client_secret, server_secret)
+}
+
+fn derive_initial_keys(dst_cid: &[u8], side: Side) -> Keys {
+    let (client_secret, server_secret) = derive_initial_secrets(dst_cid);
+    derive_directional_keys(&client_secret, &server_secret, side)
+}
+
+// ── Handshake state ───────────────────────────────────────────────────────────
+
+use quinn_proto::Side;
+
+enum HsState {
+    Initial,         // write_handshake not yet called
+    SentHandshakeKeys, // returned Handshake Keys; waiting for 1-RTT call
+    Done,            // returned 1-RTT Keys; handshake complete
+}
+
+pub struct MlsSession {
+    side:  Side,
+    state: HsState,
+}
+
+impl MlsSession {
+    pub fn new(side: Side) -> Self {
+        Self { side, state: HsState::Initial }
+    }
+}
+
+// ── Session trait impl ────────────────────────────────────────────────────────
+
+use std::any::Any;
+use quinn_proto::{
+    crypto::{ExportKeyingMaterialError, Session},
+    transport_parameters::TransportParameters,
+    ConnectionId, TransportError,
+};
+
+impl Session for MlsSession {
+    // Initial keys must follow RFC 9001 §5.2 — not MLS-derived.
+    // Replaced in Step 2 with the standard QUIC Initial key schedule.
+    fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
+        derive_initial_keys(dst_cid, side)
+    }
+
+    fn is_handshaking(&self) -> bool {
+        !matches!(self.state, HsState::Done)
+    }
+
+    // MLS group membership is the authentication — no TLS cert chain.
+    fn handshake_data(&self) -> Option<Box<dyn Any>> { None }
+    fn peer_identity(&self) -> Option<Box<dyn Any>> { None }
+
+    // 0-RTT not implemented in Phase 1.
+    fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> { None }
+    fn early_data_accepted(&self) -> Option<bool> { Some(false) }
+
+    // Step 3: decode the peer's TransportParameters from CRYPTO frames here.
+    fn read_handshake(&mut self, _buf: &[u8]) -> Result<bool, TransportError> {
+        Ok(false)
+    }
+
+    // Step 3: return Some(...) once TransportParameters are decoded.
+    fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
+        Ok(None)
+    }
+
+    // Step 2+3: write our TransportParameters into buf, then return
+    // MLS-derived Keys for the Handshake space, then 1-RTT space.
+    fn write_handshake(&mut self, _buf: &mut Vec<u8>) -> Option<Keys> {
+        None
+    }
+
+    // Step 4: advance the MLS epoch and derive new PacketKeys.
+    fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
+        None
+    }
+
+    // Retry-packet integrity: Step 2 delegates this to a standard impl.
+    fn is_valid_retry(
+        &self,
+        _orig_dst_cid: &ConnectionId,
+        _header: &[u8],
+        _payload: &[u8],
+    ) -> bool {
+        false
+    }
+
+    fn export_keying_material(
+        &self,
+        _output: &mut [u8],
+        _label: &[u8],
+        _context: &[u8],
+    ) -> Result<(), ExportKeyingMaterialError> {
+        Err(ExportKeyingMaterialError)
+    }
+}
+
+#[test]
+fn initial_secrets_are_deterministic_and_cid_sensitive() {
+    let cid_a = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
+    let cid_b = [0x00; 8];
+
+    let (client_a, server_a) = derive_initial_secrets(&cid_a);
+    let (client_a_again, _) = derive_initial_secrets(&cid_a);
+    assert_eq!(client_a, client_a_again, "same CID must give same secret");
+    assert_ne!(client_a, server_a, "client and server secrets must differ");
+
+    let (client_b, _) = derive_initial_secrets(&cid_b);
+    assert_ne!(client_a, client_b, "different CIDs must give different secrets");
+}
+
