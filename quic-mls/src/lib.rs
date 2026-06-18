@@ -204,6 +204,7 @@ mod hkdf_tests {
 //------Aes128GcmPacketKey----------------------------------------------
 use aes_gcm::{aead::AeadInPlace, Aes128Gcm, Key, KeyInit, Nonce, Tag};
 //type Aes128Gcm so default is 16 byts aeadinplace trait gives you. encrypt and decrypt in place handles buffer. key nonce tag fixed size 
+#[derive(Debug, PartialEq)]
 struct Aes128GcmPacketKey { key: [u8; 16], iv: [u8; 12] }
 fn nonce_for(iv: &[u8; 12], packet: u64) -> [u8; 12] {
     let mut nonce = *iv;
@@ -301,49 +302,74 @@ impl Aes128EcbHeaderKey {
     }
 }
 
-// Derives the QUIC keys (packet and header protection) from the given secret using HKDF-Expand-Label. The derived keys are used for encrypting and decrypting QUIC packets and headers.
-fn derive_keys(secret: &[u8]) -> Keys {
-    let key_bytes = hkdf_expand_label(secret, "quic key", b"", 16);
-    let iv_bytes  = hkdf_expand_label(secret, "quic iv",  b"", 12);
-    let hp_bytes  = hkdf_expand_label(secret, "quic hp",  b"", 16);
 
-    let key: [u8; 16] = key_bytes.try_into().expect("hkdf_expand_label returns 16 bytes");
-    let iv:  [u8; 12] = iv_bytes.try_into().expect("hkdf_expand_label returns 12 bytes");
-    let hp:  [u8; 16] = hp_bytes.try_into().expect("hkdf_expand_label returns 16 bytes");
+//----client server directional keys------------------------------------------------
+fn derive_keys_from_secret(secret: &[u8]) -> (Aes128GcmPacketKey, Aes128EcbHeaderKey) {
+    let key: [u8; 16] = hkdf_expand_label(secret, "quic key", b"", 16).try_into().expect("16 bytes");
+    let iv:  [u8; 12] = hkdf_expand_label(secret, "quic iv",  b"", 12).try_into().expect("12 bytes");
+    let hp:  [u8; 16] = hkdf_expand_label(secret, "quic hp",  b"", 16).try_into().expect("16 bytes");
+    (Aes128GcmPacketKey { key, iv }, Aes128EcbHeaderKey { key: hp })
+}
+
+fn derive_directional_keys(client_secret: &[u8], server_secret: &[u8], side: Side) -> Keys {
+    let (client_packet, client_header) = derive_keys_from_secret(client_secret);
+    let (server_packet, server_header) = derive_keys_from_secret(server_secret);
+
+    let (local_packet, remote_packet, local_header, remote_header) = match side {
+        Side::Client => (client_packet, server_packet, client_header, server_header),
+        Side::Server => (server_packet, client_packet, server_header, client_header),
+    };
 
     Keys {
-        header: KeyPair {
-            local:  Box::new(Aes128EcbHeaderKey { key: hp }),
-            remote: Box::new(Aes128EcbHeaderKey { key: hp }),
-        },
-        packet: KeyPair {
-            local:  Box::new(Aes128GcmPacketKey { key, iv }),
-            remote: Box::new(Aes128GcmPacketKey { key, iv }),
-        },
+        header: KeyPair { local: Box::new(local_header), remote: Box::new(remote_header) },
+        packet: KeyPair { local: Box::new(local_packet), remote: Box::new(remote_packet) },
     }
 }
 
 #[cfg(test)]
-mod derive_keys_tests {
+mod directional_tests {
     use super::*;
 
     #[test]
-    fn round_trip_through_derive_keys() {
-        let secret = [0x7eu8; 32];
-        let keys_a = derive_keys(&secret);
-        let keys_b = derive_keys(&secret);
+    fn client_and_server_keys_are_independent_but_cross_compatible() {
+        let client_secret = [0x11u8; 32];
+        let server_secret = [0x22u8; 32];
+
+        let client_keys = derive_directional_keys(&client_secret, &server_secret, Side::Client);
+        let server_keys = derive_directional_keys(&client_secret, &server_secret, Side::Server);
 
         let header_len = 5;
         let plaintext = b"hello quic-mls";
-        let mut buf = vec![0u8; header_len + plaintext.len() + 16]; // +16 for the tag
+        let mut buf = vec![0u8; header_len + plaintext.len() + 16];
         buf[..header_len].copy_from_slice(b"HDRXX");
         buf[header_len..header_len + plaintext.len()].copy_from_slice(plaintext);
 
-        keys_a.packet.local.encrypt(0, &mut buf, header_len);
+        // Client sends using its local key...
+        client_keys.packet.local.encrypt(0, &mut buf, header_len);
 
+        // ...server receives it using its remote key.
         let mut payload = BytesMut::from(&buf[header_len..]);
-        keys_b.packet.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
-
+        server_keys.packet.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
         assert_eq!(&payload[..], plaintext);
     }
+}
+
+
+#[test]
+fn same_secret_reproduces_identical_key_different_secret_does_not() {
+    let client_secret = [0x11u8; 32];
+    let server_secret = [0x22u8; 32];
+
+    let (client_packet, _) = derive_keys_from_secret(&client_secret);
+    let (server_packet, _) = derive_keys_from_secret(&server_secret);
+
+    // Different secrets must give different keys (direction independence).
+    assert_ne!(client_packet, server_packet);
+
+    // The SAME secret, derived twice, must give the IDENTICAL key — this is
+    // exactly why client.local (built from client_secret) and server.remote
+    // (also built from client_secret) end up byte-for-byte equal in
+    // derive_directional_keys, even though we never compare them directly there.
+    let (client_packet_again, _) = derive_keys_from_secret(&client_secret);
+    assert_eq!(client_packet, client_packet_again);
 }
