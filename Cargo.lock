@@ -1405,6 +1405,8 @@ dependencies = [
  "aes-gcm",
  "bytes",
  "hkdf",
+ "mls-rs",
+ "mls-rs-crypto-rustcrypto",
  "quinn-proto",
  "sha2",
 ]

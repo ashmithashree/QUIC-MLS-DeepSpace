@@ -259,6 +259,13 @@ fn derive_initial_keys(dst_cid: &[u8], side: Side) -> Keys {
     let (client_secret, server_secret) = derive_initial_secrets(dst_cid);
     derive_directional_keys(&client_secret, &server_secret, side)
 }
+fn derive_mls_keys(group: &dyn ExportSecret, level: &str, side: Side) -> Result<Keys, mls_rs::error::MlsError> {
+    let client_secret = group.export_secret(format!("quic-mls c2s {level}").as_bytes(), b"", 32)?;
+    let server_secret = group.export_secret(format!("quic-mls s2c {level}").as_bytes(), b"", 32)?;
+    Ok(derive_directional_keys(&client_secret, &server_secret, side))
+}
+
+
 
 // ── Handshake state ───────────────────────────────────────────────────────────
 
@@ -271,16 +278,29 @@ enum HsState {
 }
 
 pub struct MlsSession {
-    side:  Side,
+    group: Box<dyn ExportSecret>,
+    side: Side,
     state: HsState,
+    local_params: TransportParameters,
+    peer_params: Option<TransportParameters>,
 }
 
 impl MlsSession {
-    pub fn new(side: Side) -> Self {
-        Self { side, state: HsState::Initial }
+    pub fn new(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
+        Self { group, side, state: HsState::Initial, local_params, peer_params: None }
     }
 }
 
+
+pub trait ExportSecret: Send + Sync {
+    fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError>;
+}
+
+impl<C: mls_rs::client_builder::MlsConfig> ExportSecret for mls_rs::Group<C> {
+    fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        Ok(mls_rs::Group::export_secret(self, label, context, len)?.as_bytes().to_vec())
+    }
+}
 // ── Session trait impl ────────────────────────────────────────────────────────
 
 use std::any::Any;
@@ -291,7 +311,7 @@ use quinn_proto::{
 };
 
 impl Session for MlsSession {
-    // Initial keys must follow RFC 9001 §5.2 — not MLS-derived.
+    // Initial keys must follow RFC 9001 5.2 — not MLS-derived.
     // Replaced in Step 2 with the standard QUIC Initial key schedule.
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
         derive_initial_keys(dst_cid, side)
@@ -309,28 +329,41 @@ impl Session for MlsSession {
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> { None }
     fn early_data_accepted(&self) -> Option<bool> { Some(false) }
 
-    // Step 3: decode the peer's TransportParameters from CRYPTO frames here.
-    fn read_handshake(&mut self, _buf: &[u8]) -> Result<bool, TransportError> {
-        Ok(false)
-    }
-
-    // Step 3: return Some(...) once TransportParameters are decoded.
-    fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
-        Ok(None)
-    }
-
-    // Step 2+3: write our TransportParameters into buf, then return
     // MLS-derived Keys for the Handshake space, then 1-RTT space.
-    fn write_handshake(&mut self, _buf: &mut Vec<u8>) -> Option<Keys> {
-        None
+    fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
+        match self.state {
+            HsState::Initial => {
+                self.local_params.write(buf);
+                self.state = HsState::SentHandshakeKeys;
+                Some(derive_mls_keys(self.group.as_ref(), "handshake", self.side)
+                    .expect("MLS group must have a valid epoch exporter secret"))
+            }
+            HsState::SentHandshakeKeys => {
+                self.state = HsState::Done;
+                Some(derive_mls_keys(self.group.as_ref(), "1-rtt", self.side)
+                    .expect("MLS group must have a valid epoch exporter secret"))
+            }
+            HsState::Done => None,
+        }
     }
+
+    fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
+        let mut reader = buf;
+        self.peer_params = Some(TransportParameters::read(self.side, &mut reader)?);
+        Ok(false) // handshake_data() never gets populated — we have no TLS-style negotiated data
+    }
+
+    fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
+        Ok(self.peer_params)
+    }
+
 
     // Step 4: advance the MLS epoch and derive new PacketKeys.
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
         None
     }
 
-    // Retry-packet integrity: Step 2 delegates this to a standard impl.
+    
     fn is_valid_retry(
         &self,
         _orig_dst_cid: &ConnectionId,
@@ -362,5 +395,127 @@ fn initial_secrets_are_deterministic_and_cid_sensitive() {
 
     let (client_b, _) = derive_initial_secrets(&cid_b);
     assert_ne!(client_a, client_b, "different CIDs must give different secrets");
+}
+
+#[cfg(test)]
+mod handshake_key_tests {
+    use super::*;
+    use mls_rs::{
+        identity::{basic::{BasicCredential, BasicIdentityProvider}, SigningIdentity},
+        CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList,
+    };
+    use mls_rs_crypto_rustcrypto::RustCryptoProvider;
+
+    const CS: CipherSuite = CipherSuite::CURVE25519_AES128;
+
+    fn make_client(name: &str) -> Client<impl mls_rs::client_builder::MlsConfig> {
+        let crypto = RustCryptoProvider::new();
+        let cs_provider = crypto.cipher_suite_provider(CS).unwrap();
+        let (secret_key, public_key) = cs_provider.signature_key_generate().unwrap();
+        let credential = BasicCredential::new(name.as_bytes().to_vec()).into_credential();
+        let signing_identity = SigningIdentity::new(credential, public_key);
+        Client::builder()
+            .crypto_provider(RustCryptoProvider::new())
+            .identity_provider(BasicIdentityProvider::new())
+            .signing_identity(signing_identity, secret_key, CS)
+            .build()
+    }
+
+    #[test]
+    fn handshake_keys_from_real_mls_group_round_trip() {
+        let alice = make_client("alice");
+        let bob = make_client("bob");
+
+        let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+        let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+        let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+        alice_group.apply_pending_commit().unwrap();
+        let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+        let alice_keys = derive_mls_keys(&alice_group, "handshake", Side::Client).unwrap();
+        let bob_keys = derive_mls_keys(&bob_group, "handshake", Side::Server).unwrap();
+
+        let header_len = 5;
+        let plaintext = b"hello from alice";
+        let mut buf = vec![0u8; header_len + plaintext.len() + 16];
+        buf[..header_len].copy_from_slice(b"HDRXX");
+        buf[header_len..header_len + plaintext.len()].copy_from_slice(plaintext);
+
+        alice_keys.packet.local.encrypt(0, &mut buf, header_len);
+
+        let mut payload = BytesMut::from(&buf[header_len..]);
+        bob_keys.packet.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
+        assert_eq!(&payload[..], plaintext);
+    }
+#[test]
+    fn full_handshake_round_trip_between_two_sessions() {
+        let alice = make_client("alice");
+        let bob = make_client("bob");
+
+        let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+        let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+        let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+        alice_group.apply_pending_commit().unwrap();
+        let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+        
+        let alice_params = TransportParameters::read(Side::Client, &mut &[][..]).unwrap();
+        let bob_params = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+
+        let mut alice_session = MlsSession::new(Box::new(alice_group), Side::Client, alice_params);
+        let mut bob_session = MlsSession::new(Box::new(bob_group), Side::Server, bob_params);
+
+        // ── Round 1: Initial -> SentHandshakeKeys ──────────────────────────────
+        let mut alice_buf = Vec::new();
+        let alice_hs_keys = alice_session.write_handshake(&mut alice_buf).expect("handshake keys on call 1");
+
+        let mut bob_buf = Vec::new();
+        let bob_hs_keys = bob_session.write_handshake(&mut bob_buf).expect("handshake keys on call 1");
+
+        alice_session.read_handshake(&bob_buf).unwrap();
+        bob_session.read_handshake(&alice_buf).unwrap();
+
+        assert!(alice_session.transport_parameters().unwrap().is_some());
+        assert!(bob_session.transport_parameters().unwrap().is_some());
+        assert!(alice_session.is_handshaking());
+        assert!(bob_session.is_handshaking());
+
+        // Handshake-level keys must already work cross-party.
+        let header_len = 5;
+        let hs_plaintext = b"handshake level data";
+        let mut buf = vec![0u8; header_len + hs_plaintext.len() + 16];
+        buf[..header_len].copy_from_slice(b"HDRXX");
+        buf[header_len..header_len + hs_plaintext.len()].copy_from_slice(hs_plaintext);
+        alice_hs_keys.packet.local.encrypt(0, &mut buf, header_len);
+        let hs_ciphertext = buf[header_len..].to_vec();
+        let mut payload = BytesMut::from(&buf[header_len..]);
+        bob_hs_keys.packet.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
+        assert_eq!(&payload[..], hs_plaintext);
+
+        // ── Round 2: SentHandshakeKeys -> Done ─────────────────────────────────
+        let alice_1rtt_keys = alice_session.write_handshake(&mut Vec::new()).expect("1-RTT keys on call 2");
+        let bob_1rtt_keys = bob_session.write_handshake(&mut Vec::new()).expect("1-RTT keys on call 2");
+
+        assert!(!alice_session.is_handshaking());
+        assert!(!bob_session.is_handshaking());
+
+        // 1-RTT keys must also work cross-party...
+        let mut buf2 = vec![0u8; header_len + hs_plaintext.len() + 16];
+        buf2[..header_len].copy_from_slice(b"HDRXX");
+        buf2[header_len..header_len + hs_plaintext.len()].copy_from_slice(hs_plaintext);
+        alice_1rtt_keys.packet.local.encrypt(0, &mut buf2, header_len);
+        let mut payload2 = BytesMut::from(&buf2[header_len..]);
+        bob_1rtt_keys.packet.remote.decrypt(0, &buf2[..header_len], &mut payload2).unwrap();
+        assert_eq!(&payload2[..], hs_plaintext);
+
+        // ...but must be a genuinely different key: same plaintext, same packet
+        // number, different ciphertext, because "handshake" and "1-rtt" are
+        // different export_secret labels.
+        assert_ne!(hs_ciphertext, buf2[header_len..]);
+
+        // The handshake is fully done — a third call must do nothing.
+        assert!(alice_session.write_handshake(&mut Vec::new()).is_none());
+    }
+
 }
 
