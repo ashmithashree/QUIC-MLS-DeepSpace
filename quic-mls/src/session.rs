@@ -5,9 +5,10 @@ use quinn_proto::{transport_parameters::TransportParameters, ConnectionId, Side,
 use std::any::Any;
 use crate::retry::{verify_retry_tag};
 enum HsState {
-    Initial,            // write_handshake not yet called
-    SentHandshakeKeys,  // returned Handshake Keys; waiting for 1-RTT call
-    Done,                // returned 1-RTT Keys; handshake complete
+    Initial,             // call 1: write local_params at Initial level; return no keys
+    AwaitingHandshakeKeys, // gate: stay here until peer_params arrives, then signal Handshake keys
+    AwaitingOneRttKeys,    // next call: write nothing; signal 1-RTT keys ready
+    Done,                // final state: nothing left to do
 }
 
 pub struct MlsSession {
@@ -50,16 +51,24 @@ impl Session for MlsSession {
     fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> { None }
     fn early_data_accepted(&self) -> Option<bool> { Some(false) }
 
-    // MLS-derived Keys for the Handshake space, then 1-RTT space.
+    
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
         match self.state {
             HsState::Initial => {
                 self.local_params.write(buf);
-                self.state = HsState::SentHandshakeKeys;
+                self.state = HsState::AwaitingHandshakeKeys;
+                None
+            }
+            HsState::AwaitingHandshakeKeys => {
+                if self.peer_params.is_none() {
+                    return None;
+                }
+                self.state = HsState::AwaitingOneRttKeys;
                 Some(derive_mls_keys(self.group.as_ref(), "handshake", self.side)
                     .expect("MLS group must have a valid epoch exporter secret"))
             }
-            HsState::SentHandshakeKeys => {
+            HsState::AwaitingOneRttKeys => {
+                buf.push(0);
                 self.state = HsState::Done;
                 Some(derive_mls_keys(self.group.as_ref(), "1-rtt", self.side)
                     .expect("MLS group must have a valid epoch exporter secret"))
@@ -69,8 +78,13 @@ impl Session for MlsSession {
     }
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
-        let mut reader = buf;
-        self.peer_params = Some(TransportParameters::read(self.side, &mut reader)?);
+        // Only the first (Initial-level) call carries real TransportParameters.
+        // The later Handshake-level call just delivers our liveness marker
+        // byte, which has no structure to parse — ignore its content.
+        if self.peer_params.is_none() {
+            let mut reader = buf;
+            self.peer_params = Some(TransportParameters::read(self.side, &mut reader)?);
+        }
         Ok(false) // handshake_data() never gets populated — we have no TLS-style negotiated data
     }
 
@@ -169,18 +183,26 @@ mod handshake_key_tests {
         let mut alice_session = MlsSession::new(Box::new(alice_group), Side::Client, alice_params);
         let mut bob_session = MlsSession::new(Box::new(bob_group), Side::Server, bob_params);
 
-        // ── Round 1: Initial -> SentHandshakeKeys ──────────────────────────────
+        // ── Call 1 (Initial): write params at Initial level, no keys yet ──────
+        // (default-valued TransportParameters are omitted on the wire, so an
+        // empty buf here is expected — only non-default fields get written.)
         let mut alice_buf = Vec::new();
-        let alice_hs_keys = alice_session.write_handshake(&mut alice_buf).expect("handshake keys on call 1");
+        assert!(alice_session.write_handshake(&mut alice_buf).is_none());
 
         let mut bob_buf = Vec::new();
-        let bob_hs_keys = bob_session.write_handshake(&mut bob_buf).expect("handshake keys on call 1");
+        assert!(bob_session.write_handshake(&mut bob_buf).is_none());
 
         alice_session.read_handshake(&bob_buf).unwrap();
         bob_session.read_handshake(&alice_buf).unwrap();
 
         assert!(alice_session.transport_parameters().unwrap().is_some());
         assert!(bob_session.transport_parameters().unwrap().is_some());
+        assert!(alice_session.is_handshaking());
+        assert!(bob_session.is_handshaking());
+
+        // ── Call 2 (AwaitingHandshakeKeys): no data, Handshake keys ready ──────
+        let alice_hs_keys = alice_session.write_handshake(&mut Vec::new()).expect("handshake keys on call 2");
+        let bob_hs_keys = bob_session.write_handshake(&mut Vec::new()).expect("handshake keys on call 2");
         assert!(alice_session.is_handshaking());
         assert!(bob_session.is_handshaking());
 
@@ -196,9 +218,9 @@ mod handshake_key_tests {
         bob_hs_keys.packet.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
         assert_eq!(&payload[..], hs_plaintext);
 
-        // ── Round 2: SentHandshakeKeys -> Done ─────────────────────────────────
-        let alice_1rtt_keys = alice_session.write_handshake(&mut Vec::new()).expect("1-RTT keys on call 2");
-        let bob_1rtt_keys = bob_session.write_handshake(&mut Vec::new()).expect("1-RTT keys on call 2");
+        // ── Call 3 (AwaitingOneRttKeys): no data, 1-RTT keys ready -> Done ─────
+        let alice_1rtt_keys = alice_session.write_handshake(&mut Vec::new()).expect("1-RTT keys on call 3");
+        let bob_1rtt_keys = bob_session.write_handshake(&mut Vec::new()).expect("1-RTT keys on call 3");
 
         assert!(!alice_session.is_handshaking());
         assert!(!bob_session.is_handshaking());
@@ -217,7 +239,7 @@ mod handshake_key_tests {
         // different export_secret labels.
         assert_ne!(hs_ciphertext, buf2[header_len..]);
 
-        // The handshake is fully done — a third call must do nothing.
+        // The handshake is fully done — a fourth call must do nothing.
         assert!(alice_session.write_handshake(&mut Vec::new()).is_none());
     }
 

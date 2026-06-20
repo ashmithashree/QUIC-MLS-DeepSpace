@@ -63,3 +63,47 @@ impl PacketKey for Aes128GcmPacketKey {
 
     fn integrity_limit(&self) -> u64 { u64::MAX }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hkdf::{hkdf_expand_label, hkdf_label_info, INITIAL_SALT};
+    use ::hkdf::Hkdf;
+    use sha2::Sha256;
+
+    // Same known-good vector as header_key.rs's tests, reproduced from
+    // quinn-proto's own test suite (src/packet.rs::header_encoding).
+    #[test]
+    fn encrypt_matches_known_vector() {
+        let dst_cid = [0x06u8, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b];
+        let extracted = Hkdf::<Sha256>::new(Some(&INITIAL_SALT), &dst_cid);
+        let mut client_secret = vec![0u8; 32];
+        extracted
+            .expand(&hkdf_label_info("client in", b"", 32), &mut client_secret)
+            .unwrap();
+
+        let key: [u8; 16] = hkdf_expand_label(&client_secret, "quic key", b"", 16).try_into().unwrap();
+        let iv: [u8; 12] = hkdf_expand_label(&client_secret, "quic iv", b"", 12).try_into().unwrap();
+        let packet_key = Aes128GcmPacketKey { key, iv };
+
+        // Unprotected header_data (AAD) — 19 bytes, including the plain pn byte.
+        #[rustfmt::skip]
+        let header: [u8; 19] = [
+            0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b, 0x00, 0x00, 0x40, 0x21, 0x00,
+        ];
+
+        // 16 bytes of zero-padding plaintext, plus 16 bytes reserved for the tag.
+        let mut buf = header.to_vec();
+        buf.extend_from_slice(&[0u8; 16]); // plaintext
+        buf.extend_from_slice(&[0u8; 16]); // tag space
+
+        packet_key.encrypt(0, &mut buf, header.len());
+
+        #[rustfmt::skip]
+        let expected_ciphertext_and_tag: [u8; 32] = [
+            0x3e, 0xf5, 0x08, 0x07, 0xb8, 0x41, 0x91, 0xa1, 0x96, 0xf7, 0x60, 0xa6, 0xda, 0xd1, 0xe9, 0xd1, 0xc4,
+            0x30, 0xc4, 0x89, 0x52, 0xcb, 0xa0, 0x14, 0x82, 0x50, 0xc2, 0x1c, 0x0a, 0x6a, 0x70, 0xe1,
+        ];
+        assert_eq!(&buf[header.len()..], &expected_ciphertext_and_tag[..]);
+    }
+}

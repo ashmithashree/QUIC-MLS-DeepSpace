@@ -105,6 +105,71 @@ fn same_secret_reproduces_identical_key_different_secret_does_not() {
 }
 
 #[test]
+fn derive_initial_keys_server_remote_decrypts_known_client_packet() {
+    use bytes::BytesMut;
+
+    let dst_cid = [0x06u8, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b];
+    let server_keys = derive_initial_keys(&dst_cid, Side::Server);
+
+    // Known-good vector (quinn-proto's own test suite, src/packet.rs::header_encoding):
+    // a real Initial packet, encrypted by the CLIENT, that this exact
+    // dst_cid must decrypt correctly via the SERVER's `.remote` key.
+    let header: [u8; 19] = [
+        0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b, 0x00, 0x00, 0x40, 0x21, 0x00,
+    ];
+    #[rustfmt::skip]
+    let ciphertext_and_tag: [u8; 32] = [
+        0x3e, 0xf5, 0x08, 0x07, 0xb8, 0x41, 0x91, 0xa1, 0x96, 0xf7, 0x60, 0xa6, 0xda, 0xd1, 0xe9, 0xd1, 0xc4,
+        0x30, 0xc4, 0x89, 0x52, 0xcb, 0xa0, 0x14, 0x82, 0x50, 0xc2, 0x1c, 0x0a, 0x6a, 0x70, 0xe1,
+    ];
+
+    let mut payload = BytesMut::from(&ciphertext_and_tag[..]);
+    server_keys.packet.remote.decrypt(0, &header, &mut payload).unwrap();
+    assert_eq!(&payload[..], &[0u8; 16][..]);
+}
+
+#[test]
+fn full_initial_packet_round_trip_with_20_byte_cid() {
+    use bytes::BytesMut;
+
+    // Quinn's default RandomConnectionIdGenerator uses MAX_CID_SIZE (20 bytes),
+    // not the 8-byte CID from the reference vector — reproduce that shape.
+    let dst_cid: [u8; 20] = [
+        0x4d, 0xd1, 0x0b, 0x5d, 0x5c, 0x3b, 0x99, 0x7f, 0x91, 0xd5,
+        0x69, 0x9d, 0xb2, 0x68, 0x92, 0x0e, 0xd9, 0xa4, 0x7c, 0x72,
+    ];
+    let client_keys = derive_initial_keys(&dst_cid, Side::Client);
+    let server_keys = derive_initial_keys(&dst_cid, Side::Server);
+
+    // Build a realistic Initial-packet-shaped buffer: 1(first byte) +
+    // 4(version) + 1(dcid_len) + 20(dcid) + 1(scid_len) + 1(token_len) +
+    // 2(length varint) = 30 bytes of header, then a packet number byte,
+    // then plaintext, then tag space.
+    let mut header = vec![0xc0u8, 0x00, 0x00, 0x00, 0x01, 20];
+    header.extend_from_slice(&dst_cid);
+    header.extend_from_slice(&[0x00, 0x00, 0x40, 0x21]); // scid_len, token_len, length varint
+    let pn_offset = header.len();
+    header.push(0x00); // packet number byte (pn=0, 1-byte encoding)
+    let header_len = header.len();
+
+    let plaintext = [0u8; 16];
+    let mut buf = header.clone();
+    buf.extend_from_slice(&plaintext);
+    buf.extend_from_slice(&[0u8; 16]); // tag space
+
+    client_keys.packet.local.encrypt(0, &mut buf, header_len);
+    client_keys.header.local.encrypt(pn_offset, &mut buf);
+
+    // Server receives: undo header protection, then decrypt the payload.
+    server_keys.header.remote.decrypt(pn_offset, &mut buf);
+    assert_eq!(&buf[..header_len], &header[..], "header must round-trip unchanged");
+
+    let mut payload = BytesMut::from(&buf[header_len..]);
+    server_keys.packet.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
+    assert_eq!(&payload[..], &plaintext[..]);
+}
+
+#[test]
 fn initial_secrets_are_deterministic_and_cid_sensitive() {
     let cid_a = [0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08];
     let cid_b = [0x00; 8];
