@@ -59,6 +59,8 @@ impl Session for MlsSession {
                 self.state = HsState::AwaitingHandshakeKeys;
                 None
             }
+            //pushes one dummy byte to buf to signal that handshake keys are ready, then returns the derived handshake keys. The caller can then use these keys to encrypt/decrypt handshake-level packets.
+
             HsState::AwaitingHandshakeKeys => {
                 if self.peer_params.is_none() {
                     return None;
@@ -79,13 +81,11 @@ impl Session for MlsSession {
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
         // Only the first (Initial-level) call carries real TransportParameters.
-        // The later Handshake-level call just delivers our liveness marker
-        // byte, which has no structure to parse — ignore its content.
         if self.peer_params.is_none() {
             let mut reader = buf;
             self.peer_params = Some(TransportParameters::read(self.side, &mut reader)?);
         }
-        Ok(false) // handshake_data() never gets populated — we have no TLS-style negotiated data
+        Ok(false) // handshake_data() never gets populated  we have no TLS-style negotiated data
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
@@ -185,7 +185,7 @@ mod handshake_key_tests {
 
         // ── Call 1 (Initial): write params at Initial level, no keys yet ──────
         // (default-valued TransportParameters are omitted on the wire, so an
-        // empty buf here is expected — only non-default fields get written.)
+        // empty buf here is expected only non-default fields get written.)
         let mut alice_buf = Vec::new();
         assert!(alice_session.write_handshake(&mut alice_buf).is_none());
 

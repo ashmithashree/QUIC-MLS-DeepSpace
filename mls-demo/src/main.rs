@@ -19,8 +19,8 @@ enum Error {
     Crypto(String),
 }
 
-/// Build a Client whose identity is `name` using in-memory storage and the
-/// RustCrypto cipher-suite provider.
+
+
 fn make_client(name: &str) -> Result<Client<impl mls_rs::client_builder::MlsConfig>, Error> {
     let crypto = RustCryptoProvider::new();
     let cs_provider = crypto
@@ -67,7 +67,7 @@ fn main() -> Result<(), Error> {
         alice_e1, bob_e1,
         "epoch 1: alice and bob export_secret must match"
     );
-    println!("epoch 1  export_secret: alice == bob  \u{2713}");
+    println!("epoch 1  export_secret: alice == bob");
 
     // ── Epoch 1 → 2: bare Commit advances the epoch ─────────────────────────
 
@@ -89,8 +89,8 @@ fn main() -> Result<(), Error> {
         alice_e1, alice_e2,
         "epoch rotation must produce a different export_secret"
     );
-    println!("epoch 2  export_secret: alice == bob  \u{2713}");
-    println!("epoch 1  !=  epoch 2                  \u{2713}");
+    println!("epoch 2  export_secret: alice == bob");
+    println!("epoch 1  !=  epoch 2");
 
     Ok(())
 }
