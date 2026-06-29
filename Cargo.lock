@@ -1401,8 +1401,17 @@ dependencies = [
 name = "quic-mls"
 version = "0.1.0"
 dependencies = [
+ "aes",
+ "aes-gcm",
  "bytes",
+ "hkdf",
+ "mls-rs",
+ "mls-rs-crypto-rustcrypto",
+ "quinn",
  "quinn-proto",
+ "sha2",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
