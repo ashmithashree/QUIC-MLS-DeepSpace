@@ -129,3 +129,61 @@ async fn quic_mls_loopback_echo_with_rekey() {
     println!("Echo after rekey: {}", String::from_utf8_lossy(&response2));
     assert_eq!(response2, b"Hello again, QUIC-MLS!");
 }
+
+#[tokio::test]
+async fn quic_mls_loopback_0rtt_echo() {
+    init_tracing();
+    let alice = make_client("alice");
+    let bob = make_client("bob");
+
+    // Alice and Bob already share this epoch's group state -- the MLS
+    // analogue of a cached TLS session ticket -- so the client can derive
+    // 0-RTT keys without ever having connected to the server before.
+    let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+    alice_group.apply_pending_commit().unwrap();
+    let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(bob_group))));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(alice_group))));
+
+    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let incoming = server.accept().await.expect("client connected").accept().expect("accept");
+        // Server-side `into_0rtt()` always succeeds for incoming connections
+        // (it's how the server gets a usable `Connection` for 0.5-RTT
+        // responses too) -- the real question is whether the *client's*
+        // 0-RTT flight decrypts, which `accept_bi` below proves.
+        let (conn, _established) = incoming.into_0rtt().unwrap_or_else(|_| unreachable!());
+        let (mut send, mut recv) = conn.accept_bi().await.expect("client opened a 0-RTT stream");
+        let data = recv.read_to_end(1 << 16).await.expect("read request");
+        send.write_all(&data).await.expect("write response");
+        send.finish().expect("finish response stream");
+        conn.closed().await;
+    });
+
+    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    // `into_0rtt()` hands back a `Connection` usable immediately, before the
+    // handshake round trip completes, plus a future that resolves once we
+    // know whether the server accepted the early data.
+    let (conn, zero_rtt_accepted) = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .into_0rtt()
+        .unwrap_or_else(|_| panic!("0-RTT keys must be available from the shared MLS epoch"));
+
+    // Sent as the client's first flight -- no round trip has happened yet.
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"Hello, 0-RTT QUIC-MLS!").await.unwrap();
+    send.finish().unwrap();
+
+    let response = recv.read_to_end(64).await.unwrap();
+    println!("0-RTT echo: {}", String::from_utf8_lossy(&response));
+    assert_eq!(response, b"Hello, 0-RTT QUIC-MLS!");
+    assert!(zero_rtt_accepted.await, "server must accept the 0-RTT data");
+}

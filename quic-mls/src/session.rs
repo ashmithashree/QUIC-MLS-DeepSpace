@@ -1,7 +1,8 @@
 use crate::group::ExportSecret;
 use crate::keys::{derive_initial_keys, derive_mls_keys};
+use quinn_proto::coding::Codec;
 use quinn_proto::crypto::{ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, Session};
-use quinn_proto::{transport_parameters::TransportParameters, ConnectionId, Side, TransportError};
+use quinn_proto::{transport_parameters::TransportParameters, ConnectionId, Side, TransportError, VarInt};
 use std::any::Any;
 use crate::retry::{verify_retry_tag};
 enum HsState {
@@ -11,17 +12,75 @@ enum HsState {
     Done,                // final state: nothing left to do
 }
 
+// RFC 9000 s18.2 transport parameter IDs for the handful of integer
+// parameters a 0-RTT client needs in order to open a stream and write
+// flow-controlled data on it before any bytes have arrived from the server.
+const TP_INITIAL_MAX_DATA: u64 = 0x04;
+const TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
+const TP_INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
+
+// Codec::encode is the method that turns a number into its QUIC byte representation
+// the function has to actually do the encoding first, then count the result, instead of guessing the length up front
+fn encode_transport_param(buf: &mut Vec<u8>, id: u64, value: u64) {
+    //scratch buffer seperate from buf to hold the encoded value, 
+    // so we can measure its length before writing the length prefix to buf.
+    let mut encoded_value = Vec::new();
+    VarInt::from_u64(value).expect("test-scale value fits in a VarInt").encode(&mut encoded_value);
+    VarInt::from_u64(id).expect("id fits in a VarInt").encode(buf);
+    VarInt::from_u64(encoded_value.len() as u64).expect("length fits in a VarInt").encode(buf);
+    buf.extend_from_slice(&encoded_value);
+}
+
+// quinn-proto's `Connection::init_0rtt` asks the client's `Session` for
+// `transport_parameters()` *before* any bytes have been exchanged (see
+// quinn-proto's `init_0rtt`), exactly the moment a real TLS stack would
+// answer from a cached session ticket. We have no ticket store -- the
+// precondition for 0-RTT here is "the MLS group is already at a shared
+// epoch", not "we've connected to this peer before" -- so we synthesize
+// modest, fixed flow-control limits instead of remembering real ones. This
+// is a known simplification: a real cached value would reflect what the
+// server actually granted last time, not a constant guessed here. It only
+// has to be small enough that the server's real (much larger) defaults
+// satisfy `validate_resumption_from` once the genuine parameters arrive.
+fn synthetic_cached_peer_params(side: Side) -> TransportParameters {
+    let mut buf = Vec::new();
+    encode_transport_param(&mut buf, TP_INITIAL_MAX_DATA, 65536);
+    encode_transport_param(&mut buf, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 65536);
+    encode_transport_param(&mut buf, TP_INITIAL_MAX_STREAMS_BIDI, 1);
+    TransportParameters::read(side, &mut buf.as_slice())
+        .expect("hand-encoded transport parameters must parse")
+}
+
 pub struct MlsSession {
     group: Box<dyn ExportSecret>,
     side: Side,
     state: HsState,
     local_params: TransportParameters,
     peer_params: Option<TransportParameters>,
+    early_data: bool,
+    // Bootstraps `transport_parameters()` on the client only, until the
+    // server's real parameters arrive and `peer_params` takes over. See
+    // `synthetic_cached_peer_params` for why this exists.
+    cached_peer_params: Option<TransportParameters>,
 }
 
 impl MlsSession {
     pub fn new(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
-        Self { group, side, state: HsState::Initial, local_params, peer_params: None }
+        Self {
+            group, side, state: HsState::Initial, local_params,
+            peer_params: None, early_data: false, cached_peer_params: None,
+        }
+    }
+
+    // Like `new`, but offers 0-RTT keys derived from the group's *current*
+    // epoch secret, on the assumption the peer already shares that epoch --
+    // the MLS analogue of resuming from a TLS session ticket.
+    pub fn new_with_early_data(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
+        let cached_peer_params = (side == Side::Client).then(|| synthetic_cached_peer_params(side));
+        Self {
+            group, side, state: HsState::Initial, local_params,
+            peer_params: None, early_data: true, cached_peer_params,
+        }
     }
 
     pub fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError> {
@@ -47,9 +106,35 @@ impl Session for MlsSession {
     fn handshake_data(&self) -> Option<Box<dyn Any>> { None }
     fn peer_identity(&self) -> Option<Box<dyn Any>> { None }
 
-    // 0-RTT not implemented in Phase 1.
-    fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> { None }
-    fn early_data_accepted(&self) -> Option<bool> { Some(false) }
+    // 0-RTT keys, derived the same way as the 1-RTT keys but under a
+    // distinct level label so the secret is domain-separated from the
+    // handshake and 1-RTT exports (see `derive_mls_keys`).
+    //
+    // FORWARD SECRECY / REPLAY TRADE-OFF: this key comes straight from the
+    // group's *current* exported secret -- material both peers already
+    // hold from a prior epoch -- with no fresh per-connection randomness
+    // mixed in. Early data sent under it therefore has none of the
+    // freshness a full round trip provides: if this epoch's secret is ever
+    // compromised, every 0-RTT flight ever sent under it is exposed
+    // retroactively, and a captured 0-RTT flight can be replayed against the
+    // server until the epoch is rekeyed. This mirrors TLS 1.3's own 0-RTT
+    // trade-off and is accepted here for the same reason -- a zero-round-
+    // trip first flight, at the cost of forward secrecy and replay
+    // protection for that flight alone. This is intentional, not a bug to
+    // fix here.
+    fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> {
+        if !self.early_data {
+            return None;
+        }
+        let keys = derive_mls_keys(self.group.as_ref(), "0-rtt", self.side).ok()?;
+        Some((keys.header.local, keys.packet.local))
+    }
+
+    // We have no anti-replay or rejection logic of our own: acceptance is
+    // simply "did this session derive 0-RTT keys at all" (see `early_crypto`
+    // above for what that material's guarantees -- and limits -- actually
+    // are).
+    fn early_data_accepted(&self) -> Option<bool> { Some(self.early_data) }
 
     
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
@@ -89,7 +174,9 @@ impl Session for MlsSession {
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
-        Ok(self.peer_params)
+        // Real params (once read_handshake actually sees them) always win
+        // over the synthetic 0-RTT bootstrap value.
+        Ok(self.peer_params.or(self.cached_peer_params))
     }
 
     // MLS-derived Keys for the 1-RTT space, after the handshake is complete.
