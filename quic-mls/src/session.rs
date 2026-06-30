@@ -31,12 +31,12 @@ fn encode_transport_param(buf: &mut Vec<u8>, id: u64, value: u64) {
     buf.extend_from_slice(&encoded_value);
 }
 
-// quinn-proto's `Connection::init_0rtt` asks the client's `Session` for
-// `transport_parameters()` *before* any bytes have been exchanged (see
-// quinn-proto's `init_0rtt`), exactly the moment a real TLS stack would
+// quinn-proto's Connection::init_0rtt asks the client's `Session` for
+// transport_parameters() *before* any bytes have been exchanged (see
+// quinn-proto's init_0rtt), exactly the moment a real TLS stack would
 // answer from a cached session ticket. We have no ticket store -- the
 // precondition for 0-RTT here is "the MLS group is already at a shared
-// epoch", not "we've connected to this peer before" -- so we synthesize
+// epoch", not "we've connected to this peer before" so we synthesize
 // modest, fixed flow-control limits instead of remembering real ones. This
 // is a known simplification: a real cached value would reflect what the
 // server actually granted last time, not a constant guessed here. It only
@@ -73,7 +73,7 @@ impl MlsSession {
     }
 
     // Like `new`, but offers 0-RTT keys derived from the group's *current*
-    // epoch secret, on the assumption the peer already shares that epoch --
+    // epoch secret, on the assumption the peer already shares that epoch 
     // the MLS analogue of resuming from a TLS session ticket.
     pub fn new_with_early_data(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
         let cached_peer_params = (side == Side::Client).then(|| synthetic_cached_peer_params(side));
@@ -93,7 +93,7 @@ impl MlsSession {
 }
 
 impl Session for MlsSession {
-    // Initial keys must follow RFC 9001 5.2 — not MLS-derived.
+    // Initial keys must follow RFC 9001 5.2 not MLS-derived.
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
         derive_initial_keys(dst_cid, side)
     }
@@ -102,23 +102,23 @@ impl Session for MlsSession {
         !matches!(self.state, HsState::Done)
     }
 
-    // MLS group membership is the authentication — no TLS cert chain.
+    // MLS group membership is the authentication no TLS cert chain.
     fn handshake_data(&self) -> Option<Box<dyn Any>> { None }
     fn peer_identity(&self) -> Option<Box<dyn Any>> { None }
 
     // 0-RTT keys, derived the same way as the 1-RTT keys but under a
     // distinct level label so the secret is domain-separated from the
-    // handshake and 1-RTT exports (see `derive_mls_keys`).
+    // handshake and 1-RTT exports (see derive_mls_keys).
     //
     // FORWARD SECRECY / REPLAY TRADE-OFF: this key comes straight from the
-    // group's *current* exported secret -- material both peers already
-    // hold from a prior epoch -- with no fresh per-connection randomness
+    // group's *current* exported secret material both peers already
+    // hold from a prior epoch with no fresh per-connection randomness
     // mixed in. Early data sent under it therefore has none of the
     // freshness a full round trip provides: if this epoch's secret is ever
     // compromised, every 0-RTT flight ever sent under it is exposed
     // retroactively, and a captured 0-RTT flight can be replayed against the
     // server until the epoch is rekeyed. This mirrors TLS 1.3's own 0-RTT
-    // trade-off and is accepted here for the same reason -- a zero-round-
+    // trade-off and is accepted here for the same reason a zero-round-
     // trip first flight, at the cost of forward secrecy and replay
     // protection for that flight alone. This is intentional, not a bug to
     // fix here.
