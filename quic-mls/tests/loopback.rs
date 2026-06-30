@@ -136,8 +136,8 @@ async fn quic_mls_loopback_0rtt_echo() {
     let alice = make_client("alice");
     let bob = make_client("bob");
 
-    // Alice and Bob already share this epoch's group state -- the MLS
-    // analogue of a cached TLS session ticket -- so the client can derive
+    // Alice and Bob already share this epoch's group state  the MLS
+    // analogue of a cached TLS session ticket  so the client can derive
     // 0-RTT keys without ever having connected to the server before.
     let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
     let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
@@ -151,14 +151,29 @@ async fn quic_mls_loopback_0rtt_echo() {
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
 
+    // A panic inside tokio::spawn is swallowed unless the JoinHandle is
+    // awaited, so the real 0-RTT proof is reported back over a channel
+    // and asserted on the main test task below.
+    let (server_saw_0rtt_tx, server_saw_0rtt_rx) = tokio::sync::oneshot::channel();
+
     tokio::spawn(async move {
         let incoming = server.accept().await.expect("client connected").accept().expect("accept");
-        // Server-side `into_0rtt()` always succeeds for incoming connections
-        // (it's how the server gets a usable `Connection` for 0.5-RTT
-        // responses too) -- the real question is whether the *client's*
-        // 0-RTT flight decrypts, which `accept_bi` below proves.
+        // Server-side into_0rtt() always succeeds for incoming connections
+        // (it's how the server gets a usable Connection for 0.5-RTT
+        // responses too) the real question is whether the client's
+        // 0-RTT flight decrypts, which accept_bi below proves.
         let (conn, _established) = incoming.into_0rtt().unwrap_or_else(|_| unreachable!());
         let (mut send, mut recv) = conn.accept_bi().await.expect("client opened a 0-RTT stream");
+        // RecvStream::is_0rtt() reports whether this stream was handed to
+        // the application while the QUIC connection was still mid-
+        // handshake -- i.e. before any round trip could have completed.
+        // If the server's 0-RTT decryption is broken, quinn-proto silently
+        // drops the undecryptable 0-RTT packet and the data only shows up
+        // once it's retransmitted under 1-RTT after the handshake
+        // finishes, at which point is_0rtt() is false. quinn-proto 0.11.14
+        // has no decrypted-0-RTT-packet counter in ConnectionStats, so
+        // this per-stream flag is the real proof available.
+        let _ = server_saw_0rtt_tx.send(recv.is_0rtt());
         let data = recv.read_to_end(1 << 16).await.expect("read request");
         send.write_all(&data).await.expect("write response");
         send.finish().expect("finish response stream");
@@ -168,7 +183,7 @@ async fn quic_mls_loopback_0rtt_echo() {
     let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
     endpoint.set_default_client_config(client_config);
 
-    // `into_0rtt()` hands back a `Connection` usable immediately, before the
+    // into_0rtt() hands back a Connection usable immediately, before the
     // handshake round trip completes, plus a future that resolves once we
     // know whether the server accepted the early data.
     let (conn, zero_rtt_accepted) = endpoint
@@ -177,7 +192,7 @@ async fn quic_mls_loopback_0rtt_echo() {
         .into_0rtt()
         .unwrap_or_else(|_| panic!("0-RTT keys must be available from the shared MLS epoch"));
 
-    // Sent as the client's first flight -- no round trip has happened yet.
+    // Sent as the client's first flight  no round trip has happened yet.
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     send.write_all(b"Hello, 0-RTT QUIC-MLS!").await.unwrap();
     send.finish().unwrap();
@@ -185,5 +200,22 @@ async fn quic_mls_loopback_0rtt_echo() {
     let response = recv.read_to_end(64).await.unwrap();
     println!("0-RTT echo: {}", String::from_utf8_lossy(&response));
     assert_eq!(response, b"Hello, 0-RTT QUIC-MLS!");
+
+    // Primary proof: the SERVER actually decrypted this stream's data
+    // during 0-RTT, not via a 1-RTT fallback retransmission after the
+    // handshake completed.
+    let server_saw_0rtt = server_saw_0rtt_rx.await.expect("server task dropped without reporting");
+    assert!(
+        server_saw_0rtt,
+        "server only received this stream after the handshake completed -- \
+         0-RTT decryption failed and the data silently fell back to 1-RTT retransmission"
+    );
+
+    // Secondary: quinn-proto's own accepted_0rtt flag. Note this is driven
+    // entirely by the CLIENT's early_data_accepted(), which in this Session
+    // is a static `Some(self.early_data)` policy flag -- it does not by
+    // itself prove the server decrypted anything (see early_data_accepted
+    // in session.rs). The assertion above is the one that actually catches
+    // a broken server-side key.
     assert!(zero_rtt_accepted.await, "server must accept the 0-RTT data");
 }

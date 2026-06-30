@@ -32,11 +32,11 @@ fn encode_transport_param(buf: &mut Vec<u8>, id: u64, value: u64) {
 }
 
 // quinn-proto's Connection::init_0rtt asks the client's Session for
-// transport_parameters() *before* any bytes have been exchanged (see
+// transport_parameters() before any bytes have been exchanged (see
 // quinn-proto's init_0rtt), exactly the moment a real TLS stack would
-// answer from a cached session ticket. We have no ticket store the
+// answer from a cached session ticket. We have no ticket store  the
 // precondition for 0-RTT here is "the MLS group is already at a shared
-// epoch, not we've connected to this peer before so we synthesize
+// epoch", not "we've connected to this peer before" so we synthesize
 // modest, fixed flow-control limits instead of remembering real ones. This
 // is a known simplification: a real cached value would reflect what the
 // server actually granted last time, not a constant guessed here. It only
@@ -58,9 +58,9 @@ pub struct MlsSession {
     local_params: TransportParameters,
     peer_params: Option<TransportParameters>,
     early_data: bool,
-    // Bootstraps `transport_parameters()` on the client only, until the
-    // server's real parameters arrive and `peer_params` takes over. See
-    // `synthetic_cached_peer_params` for why this exists.
+    // Bootstraps transport_parameters() on the client only, until the
+    // server's real parameters arrive and peer_params takes over. See
+    // synthetic_cached_peer_params for why this exists.
     cached_peer_params: Option<TransportParameters>,
 }
 
@@ -72,7 +72,7 @@ impl MlsSession {
         }
     }
 
-    // Like `new`, but offers 0-RTT keys derived from the group's *current*
+    // Like new, but offers 0-RTT keys derived from the group's current
     // epoch secret, on the assumption the peer already shares that epoch 
     // the MLS analogue of resuming from a TLS session ticket.
     pub fn new_with_early_data(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
@@ -111,7 +111,7 @@ impl Session for MlsSession {
     // handshake and 1-RTT exports (see derive_mls_keys).
     //
     // FORWARD SECRECY / REPLAY TRADE-OFF: this key comes straight from the
-    // group's *current* exported secret material both peers already
+    // group's current exported secret material both peers already
     // hold from a prior epoch with no fresh per-connection randomness
     // mixed in. Early data sent under it therefore has none of the
     // freshness a full round trip provides: if this epoch's secret is ever
@@ -127,13 +127,33 @@ impl Session for MlsSession {
             return None;
         }
         let keys = derive_mls_keys(self.group.as_ref(), "0-rtt", self.side).ok()?;
-        Some((keys.header.local, keys.packet.local))
+        // 0-RTT only ever flows client -> server (it's the client's first
+        // flight, encrypted under the c2s-derived key). derive_mls_keys
+        // assigns .local/.remote based on each side's own send direction
+        // (.local = what this side sends with), so the server must reach
+        // across to .remote to get the c2s key it needs to decrypt the
+        // client's 0-RTT packets -- using .local here would hand the
+        // server its own s2c-derived send key instead, which can never
+        // decrypt anything the client sent.
+        let (hk, pk) = match self.side {
+            Side::Client => (keys.header.local, keys.packet.local),
+            Side::Server => (keys.header.remote, keys.packet.remote),
+        };
+        Some((hk, pk))
     }
 
     // We have no anti-replay or rejection logic of our own: acceptance is
-    // simply "did this session derive 0-RTT keys at all" (see `early_crypto`
-    // above for what that material's guarantees and limits actually
+    // simply "did this session derive 0-RTT keys at all" (see early_crypto
+    // above for what that material's guarantees  and limits  actually
     // are).
+    //
+    // NOTE: this is a static policy flag, not proof of server-side
+    // decryption success. quinn-proto only reads it on the client (see
+    // quinn-proto's Connection::process_early_payload), so a true/false
+    // here just tells the client "early data was offered," not "the server
+    // actually decrypted it." Real proof of server-side decryption has to
+    // come from the server's own observations (see is_0rtt() on the
+    // accepted RecvStream in the loopback test).
     fn early_data_accepted(&self) -> Option<bool> { Some(self.early_data) }
 
     
