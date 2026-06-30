@@ -31,17 +31,17 @@ fn encode_transport_param(buf: &mut Vec<u8>, id: u64, value: u64) {
     buf.extend_from_slice(&encoded_value);
 }
 
-// quinn-proto's Connection::init_0rtt asks the client's `Session` for
+// quinn-proto's Connection::init_0rtt asks the client's Session for
 // transport_parameters() *before* any bytes have been exchanged (see
 // quinn-proto's init_0rtt), exactly the moment a real TLS stack would
-// answer from a cached session ticket. We have no ticket store -- the
+// answer from a cached session ticket. We have no ticket store the
 // precondition for 0-RTT here is "the MLS group is already at a shared
-// epoch", not "we've connected to this peer before" so we synthesize
+// epoch, not we've connected to this peer before so we synthesize
 // modest, fixed flow-control limits instead of remembering real ones. This
 // is a known simplification: a real cached value would reflect what the
 // server actually granted last time, not a constant guessed here. It only
 // has to be small enough that the server's real (much larger) defaults
-// satisfy `validate_resumption_from` once the genuine parameters arrive.
+// satisfy validate_resumption_from once the genuine parameters arrive.
 fn synthetic_cached_peer_params(side: Side) -> TransportParameters {
     let mut buf = Vec::new();
     encode_transport_param(&mut buf, TP_INITIAL_MAX_DATA, 65536);
@@ -132,7 +132,7 @@ impl Session for MlsSession {
 
     // We have no anti-replay or rejection logic of our own: acceptance is
     // simply "did this session derive 0-RTT keys at all" (see `early_crypto`
-    // above for what that material's guarantees -- and limits -- actually
+    // above for what that material's guarantees and limits actually
     // are).
     fn early_data_accepted(&self) -> Option<bool> { Some(self.early_data) }
 
