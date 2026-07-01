@@ -5,15 +5,17 @@ use mls_rs::{
     CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList,
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-use quic_mls::{MlsClientConfig, MlsServerConfig, ExportSecret};
+use quic_mls::{MlsClientConfig, MlsServerConfig, ExportSecret, CommitLog,apply_commit_window, ControlMessage,read_message, write_message};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 
 const CS: CipherSuite = CipherSuite::CURVE25519_AES128;
+// Initialize tracing for logging
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 }
+// Helper function to create a client with a given name and a new key package.
 fn make_client(name: &str) -> Client<impl mls_rs::client_builder::MlsConfig> {
     let crypto = RustCryptoProvider::new();
     let cs_provider = crypto.cipher_suite_provider(CS).unwrap();
@@ -26,8 +28,9 @@ fn make_client(name: &str) -> Client<impl mls_rs::client_builder::MlsConfig> {
         .signing_identity(signing_identity, secret_key, CS)
         .build()
 }
+//---------------------------------------Integration tests for QUIC-MLS---------------------------------------------
 
-
+// This test demonstrates a full QUIC-MLS connection. The client sends a message, and the server echoes it back to the client.
 #[tokio::test]
 async fn quic_mls_loopback_echo() {
     init_tracing();
@@ -69,6 +72,10 @@ async fn quic_mls_loopback_echo() {
     assert_eq!(response, b"Hello, QUIC-MLS!");
 }
 
+// This test demonstrates a full QUIC-MLS connection with a rekey operation. 
+//The client sends a message, then performs a rekey, and sends another message. 
+//The server echoes both messages back to the client. With control stream, the client can send a commit window to the server, and the server can apply it to its group state and send back a report. 
+//The client can then trim its commit log based on the report. This ensures that both sides are in sync after the rekey operation.
 #[tokio::test]
 async fn quic_mls_loopback_echo_with_rekey() {
     init_tracing();
@@ -82,7 +89,7 @@ async fn quic_mls_loopback_echo_with_rekey() {
     let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
     
     //clone the group so we can keep a handle to it for rekeying after it has been moved into the MlsClientConfig
-    let alice_group = Arc::new(Mutex::new(alice_group));
+    let alice_group = Arc::new(Mutex::new(CommitLog::new(alice_group)));
     let bob_group = Arc::new(Mutex::new(bob_group));
 
     let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(Arc::clone(&bob_group)))));
@@ -93,9 +100,34 @@ async fn quic_mls_loopback_echo_with_rekey() {
     
     // make handshake and open a bidirectional stream
     tokio::spawn(async move {
+        //wait for clent and accept the connection 
         let incoming = server.accept().await.expect("client connected");
         let conn = incoming.await.expect("handshake completed");
-
+        //First bi stream is alwaya the control stream.
+        let(mut ctrl_send, mut ctrl_recv) = conn.accept_bi().await.expect("control stream");
+        
+        //handle commit window and send report in seperate task
+        let bob_group_ctrl = Arc::clone(&bob_group);
+        tokio::spawn(async move {
+            let mut local_epoch =0u64;
+            loop{
+                match read_message(&mut ctrl_recv).await {
+                    Ok(ControlMessage::CommitWindow(w)) => {
+                        {
+                            let mut guard = bob_group_ctrl.lock().unwrap();
+                            apply_commit_window(&mut *guard, &w, &mut local_epoch)
+                                .expect("commit window apply failed");
+                        } // guard dropped here, before the await below
+                        write_message(&mut ctrl_send, &ControlMessage::Report(local_epoch))
+                            .await
+                            .expect("write report failed");
+                    }
+                    Ok(ControlMessage::Report(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        //echo loop for all application data stream.
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             let data = recv.read_to_end(1 << 16).await.expect("read request");
             send.write_all(&data).await.expect("write response");
@@ -107,7 +139,10 @@ async fn quic_mls_loopback_echo_with_rekey() {
     endpoint.set_default_client_config(client_config);
 
     let conn = endpoint.connect(server_addr, "localhost").unwrap().await.unwrap();
-    //open a bidirectional stream and send a message
+    //open the control stream first - server's first accept_bi will recive this.
+    let(mut ctrl_send, mut ctrl_recv)=conn.open_bi().await.unwrap();
+    
+    //pre-rekey echo
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
     send.write_all(b"Hello, QUIC-MLS!").await.unwrap();
     send.finish().unwrap();
@@ -115,12 +150,21 @@ async fn quic_mls_loopback_echo_with_rekey() {
     let response = recv.read_to_end(64).await.unwrap();
     println!("Echo: {}", String::from_utf8_lossy(&response));
     assert_eq!(response, b"Hello, QUIC-MLS!");
-    //advance the epoch
-    let commit = alice_group.lock().unwrap().create_commit().unwrap();
-    bob_group.lock().unwrap().apply_commit(&commit).unwrap();
-    //force a key update on the connection
+
+    //create commit - commiting logs it internally , no need to keep the bytes around. we will send the commit window to bob and he will apply it to his group.
+    alice_group.lock().unwrap().create_commit().unwrap();
+    let window = alice_group.lock().unwrap().window_bytes();
+    write_message(&mut ctrl_send, &ControlMessage::CommitWindow(window)).await.unwrap();
+    
+    //wait for bob's report before flipping keys.
+    if let Ok(ControlMessage::Report(epoch))= read_message(&mut ctrl_recv).await {
+        alice_group.lock().unwrap().trim(epoch);
+    } 
+
+    //update the keysin connection
     conn.force_key_update();
-    //open stream and send a message after rekey
+    
+    //post-rekey echo
     let (mut send2, mut recv2) = conn.open_bi().await.unwrap();
     send2.write_all(b"Hello again, QUIC-MLS!").await.unwrap();
     send2.finish().unwrap();
@@ -130,6 +174,7 @@ async fn quic_mls_loopback_echo_with_rekey() {
     assert_eq!(response2, b"Hello again, QUIC-MLS!");
 }
 
+// this is 0 RTT test for the quic-mls connection. it uses the same group state on both sides of the connection so that the client can derive 0-RTT keys without ever having connected to the server before.
 #[tokio::test]
 async fn quic_mls_loopback_0rtt_echo() {
     init_tracing();
@@ -219,3 +264,11 @@ async fn quic_mls_loopback_0rtt_echo() {
     // a broken server-side key.
     assert!(zero_rtt_accepted.await, "server must accept the 0-RTT data");
 }
+
+//---------------------------------------Acceptance tests for Quic MLS-------------------------------------------------------------------
+// this is a bidirectional stream that is opened first on both sides of the connection and is used to send commit windows and reports between the client and server.
+
+#[tokio::test]
+//fn quic_mls_single_blackout_no_report{
+
+//}

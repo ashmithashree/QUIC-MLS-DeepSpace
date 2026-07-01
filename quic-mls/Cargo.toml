@@ -11,6 +11,8 @@ aes         = { workspace = true }
 hkdf        = { workspace = true }
 sha2        = { workspace = true }
 mls-rs      = { workspace = true }
+quinn       = { workspace = true }
+tokio       = { workspace = true }
 
 [dev-dependencies]
 mls-rs-crypto-rustcrypto = { workspace = true }
