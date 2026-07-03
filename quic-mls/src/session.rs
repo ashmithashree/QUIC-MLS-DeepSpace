@@ -62,13 +62,14 @@ pub struct MlsSession {
     // server's real parameters arrive and peer_params takes over. See
     // synthetic_cached_peer_params for why this exists.
     cached_peer_params: Option<TransportParameters>,
+    key_update_generation: u64,
 }
 
 impl MlsSession {
     pub fn new(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
         Self {
             group, side, state: HsState::Initial, local_params,
-            peer_params: None, early_data: false, cached_peer_params: None,
+            peer_params: None, early_data: false, cached_peer_params: None, key_update_generation: 0,
         }
     }
 
@@ -79,7 +80,7 @@ impl MlsSession {
         let cached_peer_params = (side == Side::Client).then(|| synthetic_cached_peer_params(side));
         Self {
             group, side, state: HsState::Initial, local_params,
-            peer_params: None, early_data: true, cached_peer_params,
+            peer_params: None, early_data: true, cached_peer_params,key_update_generation: 0,
         }
     }
 
@@ -126,7 +127,7 @@ impl Session for MlsSession {
         if !self.early_data {
             return None;
         }
-        let keys = derive_mls_keys(self.group.as_ref(), "0-rtt", self.side).ok()?;
+        let keys = derive_mls_keys(self.group.as_ref(), "0-rtt", self.side, b"").ok()?;
         // 0-RTT only ever flows client -> server (it's the client's first
         // flight, encrypted under the c2s-derived key). derive_mls_keys
         // assigns .local/.remote based on each side's own send direction
@@ -171,13 +172,13 @@ impl Session for MlsSession {
                     return None;
                 }
                 self.state = HsState::AwaitingOneRttKeys;
-                Some(derive_mls_keys(self.group.as_ref(), "handshake", self.side)
+                Some(derive_mls_keys(self.group.as_ref(), "handshake", self.side, b"")
                     .expect("MLS group must have a valid epoch exporter secret"))
             }
             HsState::AwaitingOneRttKeys => {
                 buf.push(0);
                 self.state = HsState::Done;
-                Some(derive_mls_keys(self.group.as_ref(), "1-rtt", self.side)
+                Some(derive_mls_keys(self.group.as_ref(), "1-rtt", self.side, b"")
                     .expect("MLS group must have a valid epoch exporter secret"))
             }
             HsState::Done => None,
@@ -201,9 +202,12 @@ impl Session for MlsSession {
 
     // MLS-derived Keys for the 1-RTT space, after the handshake is complete.
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        let keys = derive_mls_keys(self.group.as_ref(), "1-rtt", self.side)
-            .expect("MLS group must have a valid epoch exporter secret");
-        Some(keys.packet)
+        self.key_update_generation += 1;
+    let keys = derive_mls_keys(
+        self.group.as_ref(), "1-rtt", self.side,
+        &self.key_update_generation.to_be_bytes(),
+    ).expect("MLS group must have a valid epoch exporter secret");
+    Some(keys.packet)
     }
 
     fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
@@ -257,8 +261,8 @@ mod handshake_key_tests {
         alice_group.apply_pending_commit().unwrap();
         let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
 
-        let alice_keys = derive_mls_keys(&alice_group, "handshake", Side::Client).unwrap();
-        let bob_keys = derive_mls_keys(&bob_group, "handshake", Side::Server).unwrap();
+        let alice_keys = derive_mls_keys(&alice_group, "handshake", Side::Client, b"").unwrap();
+        let bob_keys = derive_mls_keys(&bob_group, "handshake", Side::Server, b"").unwrap();
 
         let header_len = 5;
         let plaintext = b"hello from alice";
@@ -461,6 +465,53 @@ fn quic_mls_distinct_keys_per_epoch() {
     // Same plaintext, same packet number, two consecutive commits ->
     // the derived keys must still be genuinely different.
     assert_ne!(ciphertext_a, ciphertext_b);
+}
+#[test]
+fn next_1rtt_keys_reflects_new_generation_within_same_epoch() {
+   let alice = make_client("alice");
+        let bob = make_client("bob");
+
+        let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+        let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+        let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+        alice_group.apply_pending_commit().unwrap();
+        let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+        let mut alice_session = MlsSession::new(
+            Box::new(alice_group), Side::Client,
+            TransportParameters::read(Side::Client, &mut &[][..]).unwrap(),
+        );
+        let mut bob_session = MlsSession::new(
+            Box::new(bob_group), Side::Server,
+            TransportParameters::read(Side::Server, &mut &[][..]).unwrap(),
+        );
+
+    let alice_gen1 = alice_session.next_1rtt_keys().expect("gen 1 keys");
+    let bob_gen1   = bob_session.next_1rtt_keys().expect("gen 1 keys");
+    // round-trip encrypt/decrypt gen1, capture ciphertext (same header_len/plaintext/pn=0 pattern as the existing tests)
+    let header_len = 5;
+    let plaintext = b"epoch data";
+    let mut buf1 = vec![0u8; header_len + plaintext.len() + 16];        
+    buf1[..header_len].copy_from_slice(b"HDRXX");
+    buf1[header_len..header_len + plaintext.len()].copy_from_slice(plaintext);
+    alice_gen1.local.encrypt(0, &mut buf1, header_len);
+    let gen1_ciphertext = buf1[header_len..].to_vec();        
+    let mut payload1 = BytesMut::from(&buf1[header_len..]);
+    bob_gen1.remote.decrypt(0, &buf1[..header_len], &mut payload1).unwrap();
+    assert_eq!(&payload1[..], plaintext);
+    // NO commit here — same epoch, just call again:
+    let alice_gen2 = alice_session.next_1rtt_keys().expect("gen 2 keys");
+    let bob_gen2   = bob_session.next_1rtt_keys().expect("gen 2 keys");
+    // round-trip encrypt/decrypt gen2 cross-party, same plaintext + pn=0
+    let mut buf2 = vec![0u8; header_len + plaintext.len() + 16];        
+    buf2[..header_len].copy_from_slice(b"HDRXX");
+    buf2[header_len..header_len + plaintext.len()].copy_from_slice(plaintext);
+    alice_gen2.local.encrypt(0, &mut buf2, header_len);
+    let gen2_ciphertext = buf2[header_len..].to_vec();        
+    let mut payload2 = BytesMut::from(&buf2[header_len..]);
+    bob_gen2.remote.decrypt(0, &buf2[..header_len], &mut payload2).unwrap();
+    assert_eq!(&payload2[..], plaintext);
+    assert_ne!(gen1_ciphertext, gen2_ciphertext); // genuinely different key, same epoch
 }
 
 }

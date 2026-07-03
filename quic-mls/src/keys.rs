@@ -1,3 +1,4 @@
+// Reference vector from https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity
 use crate::group::ExportSecret;
 use crate::header_key::Aes128EcbHeaderKey;
 use crate::hkdf::{hkdf_expand_label, hkdf_label_info, INITIAL_SALT};
@@ -6,7 +7,6 @@ use hkdf::Hkdf;
 use quinn_proto::crypto::{KeyPair, Keys};
 use quinn_proto::Side;
 use sha2::Sha256;
-
 fn derive_keys_from_secret(secret: &[u8]) -> (Aes128GcmPacketKey, Aes128EcbHeaderKey) {
     let key: [u8; 16] = hkdf_expand_label(secret, "quic key", b"", 16).try_into().expect("16 bytes");
     let iv:  [u8; 12] = hkdf_expand_label(secret, "quic iv",  b"", 12).try_into().expect("12 bytes");
@@ -50,9 +50,9 @@ pub(crate) fn derive_initial_keys(dst_cid: &[u8], side: Side) -> Keys {
     derive_directional_keys(&client_secret, &server_secret, side)
 }
 
-pub(crate) fn derive_mls_keys(group: &dyn ExportSecret, level: &str, side: Side) -> Result<Keys, mls_rs::error::MlsError> {
-    let client_secret = group.export_secret(format!("quic-mls c2s {level}").as_bytes(), b"", 32)?;
-    let server_secret = group.export_secret(format!("quic-mls s2c {level}").as_bytes(), b"", 32)?;
+pub(crate) fn derive_mls_keys(group: &dyn ExportSecret, level: &str, side: Side,context: &[u8]) -> Result<Keys, mls_rs::error::MlsError> {
+    let client_secret = group.export_secret(format!("quic-mls c2s {level}").as_bytes(), context, 32)?;
+    let server_secret = group.export_secret(format!("quic-mls s2c {level}").as_bytes(), context, 32)?;
     Ok(derive_directional_keys(&client_secret, &server_secret, side))
 }
 
