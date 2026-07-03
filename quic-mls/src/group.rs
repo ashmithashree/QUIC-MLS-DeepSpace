@@ -97,41 +97,45 @@ impl<G: ExportSecret> CommitLog<G> {
         self.checkpoint
     }
 }
-/// Returned when the incoming window starts at an epoch the receiver cannot reach —
-/// the peer fell off the back of the sender's commit log and cannot catch up without
-/// a full resync.
+/// Error returned by [`apply_commit_window`].
 #[derive(Debug)]
-pub struct ResyncNeeded;
+pub enum CommitWindowError {
+    /// Gap in received epochs — the peer fell off the back of the sender's commit log.
+    ResyncNeeded,
+    /// The MLS library rejected the commit (e.g. corrupted bytes under packet loss).
+    MlsError(mls_rs::error::MlsError),
+}
 
-impl std::fmt::Display for ResyncNeeded {
+impl std::fmt::Display for CommitWindowError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "fell off the back of the commit window: gap in received epochs")
+        match self {
+            CommitWindowError::ResyncNeeded => {
+                write!(f, "fell off the back of the commit window: gap in received epochs")
+            }
+            CommitWindowError::MlsError(e) => write!(f, "MLS error applying commit: {e}"),
+        }
     }
 }
 
-impl std::error::Error for ResyncNeeded {}
+impl std::error::Error for CommitWindowError {}
 
 /// Processes a received commit window on the receiver side.
-
-/// Guarantees: after a successful return *local_epoch equals the epoch of the
-/// last commit in the window.  Stale entries (epoch <= current) are silently
-/// skipped.  A gap (epoch > current + 1) is a fatal error: the caller must
-/// trigger a full resync.
+///
+/// Stale entries (epoch ≤ current) are silently skipped.  A gap or a
+/// malformed commit returns an error; the caller must trigger a full resync.
 pub fn apply_commit_window(
     group: &mut dyn ExportSecret,
     window: &[(u64, Vec<u8>)],
     local_epoch: &mut u64,
-) -> Result<(), ResyncNeeded> {
+) -> Result<(), CommitWindowError> {
     for (epoch, commit_bytes) in window {
         if *epoch <= *local_epoch {
-            // Stale commit already applied — skip quietly.
             continue;
         } else if *epoch == *local_epoch + 1 {
-            group.apply_commit(commit_bytes).expect("MLS commit application failed");
+            group.apply_commit(commit_bytes).map_err(CommitWindowError::MlsError)?;
             *local_epoch += 1;
         } else {
-            // Gap: epoch jumped past local_epoch + 1, receiver cannot catch up.
-            return Err(ResyncNeeded);
+            return Err(CommitWindowError::ResyncNeeded);
         }
     }
     Ok(())

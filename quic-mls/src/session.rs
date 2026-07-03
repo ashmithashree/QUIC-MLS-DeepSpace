@@ -404,4 +404,63 @@ mod handshake_key_tests {
         // Same plaintext, same packet number, genuinely different key.
         assert_ne!(epoch1_ciphertext, buf2[header_len..]);
     }
+    #[test]
+fn quic_mls_distinct_keys_per_epoch() {
+    let alice = make_client("alice");
+    let bob = make_client("bob");
+
+    let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+    alice_group.apply_pending_commit().unwrap();
+    let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+    let mut alice_session = MlsSession::new(
+        Box::new(alice_group), Side::Client,
+        TransportParameters::read(Side::Client, &mut &[][..]).unwrap(),
+    );
+    let mut bob_session = MlsSession::new(
+        Box::new(bob_group), Side::Server,
+        TransportParameters::read(Side::Server, &mut &[][..]).unwrap(),
+    );
+
+    let header_len = 5;
+    let plaintext = b"epoch data";
+
+    
+    let round_trip = |alice_keys: &KeyPair<Box<dyn PacketKey>>,
+                       bob_keys: &KeyPair<Box<dyn PacketKey>>|
+                       -> Vec<u8> {
+        let mut buf = vec![0u8; header_len + plaintext.len() + 16];
+        buf[..header_len].copy_from_slice(b"HDRXX");
+        buf[header_len..header_len + plaintext.len()].copy_from_slice(plaintext);
+        alice_keys.local.encrypt(0, &mut buf, header_len);
+        let ciphertext = buf[header_len..].to_vec();
+
+        let mut payload = BytesMut::from(&buf[header_len..]);
+        bob_keys.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
+        assert_eq!(&payload[..], plaintext);
+
+        ciphertext
+    };
+
+    // Commit #1: epoch 1 -> 2.
+    let commit1 = alice_session.create_commit().unwrap();
+    bob_session.apply_commit(&commit1).unwrap();
+    let alice_epoch_a = alice_session.next_1rtt_keys().expect("keys after commit 1");
+    let bob_epoch_a = bob_session.next_1rtt_keys().expect("keys after commit 1");
+    let ciphertext_a = round_trip(&alice_epoch_a, &bob_epoch_a);
+
+    // Commit #2: epoch 2 -> 3.
+    let commit2 = alice_session.create_commit().unwrap();
+    bob_session.apply_commit(&commit2).unwrap();
+    let alice_epoch_b = alice_session.next_1rtt_keys().expect("keys after commit 2");
+    let bob_epoch_b = bob_session.next_1rtt_keys().expect("keys after commit 2");
+    let ciphertext_b = round_trip(&alice_epoch_b, &bob_epoch_b);
+
+    // Same plaintext, same packet number, two consecutive commits ->
+    // the derived keys must still be genuinely different.
+    assert_ne!(ciphertext_a, ciphertext_b);
+}
+
 }
