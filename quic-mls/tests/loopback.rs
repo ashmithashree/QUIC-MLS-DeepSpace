@@ -176,6 +176,59 @@ async fn quic_mls_loopback_echo_with_rekey() {
     println!("Echo after rekey: {}", String::from_utf8_lossy(&response2));
     assert_eq!(response2, b"Hello again, QUIC-MLS!");
 }
+use tokio::time::Duration;
+#[tokio::test]
+async fn quic_mls_loopback_echo_rekey_multiple_times()
+{
+    init_tracing();
+    let (alice_raw, bob_raw) = make_mls_groups();
+    let alice_group = Arc::new(Mutex::new(CommitLog::new(alice_raw)));
+    let bob_group   = Arc::new(Mutex::new(bob_raw));
+    let (server, server_addr, client_config) = make_quic_pair(&alice_group, &bob_group);
+
+     tokio::spawn(async move {
+        let incoming = server.accept().await.expect("client connected");
+        let conn = incoming.await.expect("handshake completed");
+        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+            let data = recv.read_to_end(1 << 16).await.expect("read request");
+            send.write_all(&data).await.expect("write response");
+            send.finish().expect("finish response stream");
+        }
+        conn.closed().await;
+    });
+
+
+    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    let conn = endpoint.connect(server_addr, "localhost").unwrap().await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"Hello, QUIC-MLS!").await.unwrap();
+    send.finish().unwrap();
+    let response1 = recv.read_to_end(64).await.unwrap();
+    println!("Echo: before force key update: {}", String::from_utf8_lossy(&response1));
+    assert_eq!(response1, b"Hello, QUIC-MLS!");
+    conn.force_key_update();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"Hello, QUIC-MLS!").await.unwrap();
+    send.finish().unwrap();
+    let response2 = recv.read_to_end(64).await.unwrap();
+    println!("Echo after force key update 2nd time: {}", String::from_utf8_lossy(&response2));
+    assert_eq!(response2, b"Hello, QUIC-MLS!");
+    conn.force_key_update();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"Hello, QUIC-MLS!").await.unwrap();
+    send.finish().unwrap();
+    let response3 = recv.read_to_end(64).await.unwrap();
+    println!("Echo after force key update 3rd time: {}", String::from_utf8_lossy(&response3));
+    assert_eq!(response3, b"Hello, QUIC-MLS!");
+    conn.force_key_update();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
 
 // this is 0 RTT test for the quic-mls connection. it uses the same group state on both sides of the connection so that the client can derive 0-RTT keys without ever having connected to the server before.
 #[tokio::test]
@@ -359,6 +412,10 @@ async fn quic_mls_two_blackouts(){
     assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 3);
 }
 
+
+
+
+//----------------------------------------------unit test for group.rs-------------------------------------
 #[test]
 //Build a window that includes an already-applied commit 
 //this should be rejected by the server and not applied to the group state. because if bob has already applied a commit,
