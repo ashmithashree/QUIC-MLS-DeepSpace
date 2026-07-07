@@ -1,7 +1,8 @@
 use crate::group::ExportSecret;
 use crate::keys::{derive_initial_keys, derive_mls_keys};
+use quinn_proto::coding::Codec;
 use quinn_proto::crypto::{ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, Session};
-use quinn_proto::{transport_parameters::TransportParameters, ConnectionId, Side, TransportError};
+use quinn_proto::{transport_parameters::TransportParameters, ConnectionId, Side, TransportError, VarInt};
 use std::any::Any;
 use crate::retry::{verify_retry_tag};
 enum HsState {
@@ -11,17 +12,76 @@ enum HsState {
     Done,                // final state: nothing left to do
 }
 
+// RFC 9000 s18.2 transport parameter IDs for the handful of integer
+// parameters a 0-RTT client needs in order to open a stream and write
+// flow-controlled data on it before any bytes have arrived from the server.
+const TP_INITIAL_MAX_DATA: u64 = 0x04;
+const TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
+const TP_INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
+
+// Codec::encode is the method that turns a number into its QUIC byte representation
+// the function has to actually do the encoding first, then count the result, instead of guessing the length up front
+fn encode_transport_param(buf: &mut Vec<u8>, id: u64, value: u64) {
+    //scratch buffer seperate from buf to hold the encoded value, 
+    // so we can measure its length before writing the length prefix to buf.
+    let mut encoded_value = Vec::new();
+    VarInt::from_u64(value).expect("test-scale value fits in a VarInt").encode(&mut encoded_value);
+    VarInt::from_u64(id).expect("id fits in a VarInt").encode(buf);
+    VarInt::from_u64(encoded_value.len() as u64).expect("length fits in a VarInt").encode(buf);
+    buf.extend_from_slice(&encoded_value);
+}
+
+// quinn-proto's Connection::init_0rtt asks the client's Session for
+// transport_parameters() before any bytes have been exchanged (see
+// quinn-proto's init_0rtt), exactly the moment a real TLS stack would
+// answer from a cached session ticket. We have no ticket store  the
+// precondition for 0-RTT here is "the MLS group is already at a shared
+// epoch", not "we've connected to this peer before" so we synthesize
+// modest, fixed flow-control limits instead of remembering real ones. This
+// is a known simplification: a real cached value would reflect what the
+// server actually granted last time, not a constant guessed here. It only
+// has to be small enough that the server's real (much larger) defaults
+// satisfy validate_resumption_from once the genuine parameters arrive.
+fn synthetic_cached_peer_params(side: Side) -> TransportParameters {
+    let mut buf = Vec::new();
+    encode_transport_param(&mut buf, TP_INITIAL_MAX_DATA, 65536);
+    encode_transport_param(&mut buf, TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, 65536);
+    encode_transport_param(&mut buf, TP_INITIAL_MAX_STREAMS_BIDI, 1);
+    TransportParameters::read(side, &mut buf.as_slice())
+        .expect("hand-encoded transport parameters must parse")
+}
+
 pub struct MlsSession {
     group: Box<dyn ExportSecret>,
     side: Side,
     state: HsState,
     local_params: TransportParameters,
     peer_params: Option<TransportParameters>,
+    early_data: bool,
+    // Bootstraps transport_parameters() on the client only, until the
+    // server's real parameters arrive and peer_params takes over. See
+    // synthetic_cached_peer_params for why this exists.
+    cached_peer_params: Option<TransportParameters>,
+    key_update_generation: u64,
 }
 
 impl MlsSession {
     pub fn new(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
-        Self { group, side, state: HsState::Initial, local_params, peer_params: None }
+        Self {
+            group, side, state: HsState::Initial, local_params,
+            peer_params: None, early_data: false, cached_peer_params: None, key_update_generation: 0,
+        }
+    }
+
+    // Like new, but offers 0-RTT keys derived from the group's current
+    // epoch secret, on the assumption the peer already shares that epoch 
+    // the MLS analogue of resuming from a TLS session ticket.
+    pub fn new_with_early_data(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
+        let cached_peer_params = (side == Side::Client).then(|| synthetic_cached_peer_params(side));
+        Self {
+            group, side, state: HsState::Initial, local_params,
+            peer_params: None, early_data: true, cached_peer_params,key_update_generation: 0,
+        }
     }
 
     pub fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError> {
@@ -34,7 +94,7 @@ impl MlsSession {
 }
 
 impl Session for MlsSession {
-    // Initial keys must follow RFC 9001 5.2 — not MLS-derived.
+    // Initial keys must follow RFC 9001 5.2 not MLS-derived.
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
         derive_initial_keys(dst_cid, side)
     }
@@ -43,13 +103,59 @@ impl Session for MlsSession {
         !matches!(self.state, HsState::Done)
     }
 
-    // MLS group membership is the authentication — no TLS cert chain.
+    // MLS group membership is the authentication no TLS cert chain.
     fn handshake_data(&self) -> Option<Box<dyn Any>> { None }
     fn peer_identity(&self) -> Option<Box<dyn Any>> { None }
 
-    // 0-RTT not implemented in Phase 1.
-    fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> { None }
-    fn early_data_accepted(&self) -> Option<bool> { Some(false) }
+    // 0-RTT keys, derived the same way as the 1-RTT keys but under a
+    // distinct level label so the secret is domain-separated from the
+    // handshake and 1-RTT exports (see derive_mls_keys).
+    //
+    // FORWARD SECRECY / REPLAY TRADE-OFF: this key comes straight from the
+    // group's current exported secret material both peers already
+    // hold from a prior epoch with no fresh per-connection randomness
+    // mixed in. Early data sent under it therefore has none of the
+    // freshness a full round trip provides: if this epoch's secret is ever
+    // compromised, every 0-RTT flight ever sent under it is exposed
+    // retroactively, and a captured 0-RTT flight can be replayed against the
+    // server until the epoch is rekeyed. This mirrors TLS 1.3's own 0-RTT
+    // trade-off and is accepted here for the same reason a zero-round-
+    // trip first flight, at the cost of forward secrecy and replay
+    // protection for that flight alone. This is intentional, not a bug to
+    // fix here.
+    fn early_crypto(&self) -> Option<(Box<dyn HeaderKey>, Box<dyn PacketKey>)> {
+        if !self.early_data {
+            return None;
+        }
+        let keys = derive_mls_keys(self.group.as_ref(), "0-rtt", self.side, b"").ok()?;
+        // 0-RTT only ever flows client -> server (it's the client's first
+        // flight, encrypted under the c2s-derived key). derive_mls_keys
+        // assigns .local/.remote based on each side's own send direction
+        // (.local = what this side sends with), so the server must reach
+        // across to .remote to get the c2s key it needs to decrypt the
+        // client's 0-RTT packets -- using .local here would hand the
+        // server its own s2c-derived send key instead, which can never
+        // decrypt anything the client sent.
+        let (hk, pk) = match self.side {
+            Side::Client => (keys.header.local, keys.packet.local),
+            Side::Server => (keys.header.remote, keys.packet.remote),
+        };
+        Some((hk, pk))
+    }
+
+    // We have no anti-replay or rejection logic of our own: acceptance is
+    // simply "did this session derive 0-RTT keys at all" (see early_crypto
+    // above for what that material's guarantees  and limits  actually
+    // are).
+    //
+    // NOTE: this is a static policy flag, not proof of server-side
+    // decryption success. quinn-proto only reads it on the client (see
+    // quinn-proto's Connection::process_early_payload), so a true/false
+    // here just tells the client "early data was offered," not "the server
+    // actually decrypted it." Real proof of server-side decryption has to
+    // come from the server's own observations (see is_0rtt() on the
+    // accepted RecvStream in the loopback test).
+    fn early_data_accepted(&self) -> Option<bool> { Some(self.early_data) }
 
     
     fn write_handshake(&mut self, buf: &mut Vec<u8>) -> Option<Keys> {
@@ -59,18 +165,20 @@ impl Session for MlsSession {
                 self.state = HsState::AwaitingHandshakeKeys;
                 None
             }
+            //pushes one dummy byte to buf to signal that handshake keys are ready, then returns the derived handshake keys. The caller can then use these keys to encrypt/decrypt handshake-level packets.
+
             HsState::AwaitingHandshakeKeys => {
                 if self.peer_params.is_none() {
                     return None;
                 }
                 self.state = HsState::AwaitingOneRttKeys;
-                Some(derive_mls_keys(self.group.as_ref(), "handshake", self.side)
+                Some(derive_mls_keys(self.group.as_ref(), "handshake", self.side, b"")
                     .expect("MLS group must have a valid epoch exporter secret"))
             }
             HsState::AwaitingOneRttKeys => {
                 buf.push(0);
                 self.state = HsState::Done;
-                Some(derive_mls_keys(self.group.as_ref(), "1-rtt", self.side)
+                Some(derive_mls_keys(self.group.as_ref(), "1-rtt", self.side, b"")
                     .expect("MLS group must have a valid epoch exporter secret"))
             }
             HsState::Done => None,
@@ -79,24 +187,27 @@ impl Session for MlsSession {
 
     fn read_handshake(&mut self, buf: &[u8]) -> Result<bool, TransportError> {
         // Only the first (Initial-level) call carries real TransportParameters.
-        // The later Handshake-level call just delivers our liveness marker
-        // byte, which has no structure to parse — ignore its content.
         if self.peer_params.is_none() {
             let mut reader = buf;
             self.peer_params = Some(TransportParameters::read(self.side, &mut reader)?);
         }
-        Ok(false) // handshake_data() never gets populated — we have no TLS-style negotiated data
+        Ok(false) // handshake_data() never gets populated  we have no TLS-style negotiated data
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
-        Ok(self.peer_params)
+        // Real params (once read_handshake actually sees them) always win
+        // over the synthetic 0-RTT bootstrap value.
+        Ok(self.peer_params.or(self.cached_peer_params))
     }
 
     // MLS-derived Keys for the 1-RTT space, after the handshake is complete.
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
-        let keys = derive_mls_keys(self.group.as_ref(), "1-rtt", self.side)
-            .expect("MLS group must have a valid epoch exporter secret");
-        Some(keys.packet)
+        self.key_update_generation += 1;
+    let keys = derive_mls_keys(
+        self.group.as_ref(), "1-rtt", self.side,
+        &self.key_update_generation.to_be_bytes(),
+    ).expect("MLS group must have a valid epoch exporter secret");
+    Some(keys.packet)
     }
 
     fn is_valid_retry(&self, orig_dst_cid: &ConnectionId, header: &[u8], payload: &[u8]) -> bool {
@@ -150,8 +261,8 @@ mod handshake_key_tests {
         alice_group.apply_pending_commit().unwrap();
         let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
 
-        let alice_keys = derive_mls_keys(&alice_group, "handshake", Side::Client).unwrap();
-        let bob_keys = derive_mls_keys(&bob_group, "handshake", Side::Server).unwrap();
+        let alice_keys = derive_mls_keys(&alice_group, "handshake", Side::Client, b"").unwrap();
+        let bob_keys = derive_mls_keys(&bob_group, "handshake", Side::Server, b"").unwrap();
 
         let header_len = 5;
         let plaintext = b"hello from alice";
@@ -185,7 +296,7 @@ mod handshake_key_tests {
 
         // ── Call 1 (Initial): write params at Initial level, no keys yet ──────
         // (default-valued TransportParameters are omitted on the wire, so an
-        // empty buf here is expected — only non-default fields get written.)
+        // empty buf here is expected only non-default fields get written.)
         let mut alice_buf = Vec::new();
         assert!(alice_session.write_handshake(&mut alice_buf).is_none());
 
@@ -297,4 +408,110 @@ mod handshake_key_tests {
         // Same plaintext, same packet number, genuinely different key.
         assert_ne!(epoch1_ciphertext, buf2[header_len..]);
     }
+    #[test]
+fn quic_mls_distinct_keys_per_epoch() {
+    let alice = make_client("alice");
+    let bob = make_client("bob");
+
+    let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+    alice_group.apply_pending_commit().unwrap();
+    let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+    let mut alice_session = MlsSession::new(
+        Box::new(alice_group), Side::Client,
+        TransportParameters::read(Side::Client, &mut &[][..]).unwrap(),
+    );
+    let mut bob_session = MlsSession::new(
+        Box::new(bob_group), Side::Server,
+        TransportParameters::read(Side::Server, &mut &[][..]).unwrap(),
+    );
+
+    let header_len = 5;
+    let plaintext = b"epoch data";
+
+    
+    let round_trip = |alice_keys: &KeyPair<Box<dyn PacketKey>>,
+                       bob_keys: &KeyPair<Box<dyn PacketKey>>|
+                       -> Vec<u8> {
+        let mut buf = vec![0u8; header_len + plaintext.len() + 16];
+        buf[..header_len].copy_from_slice(b"HDRXX");
+        buf[header_len..header_len + plaintext.len()].copy_from_slice(plaintext);
+        alice_keys.local.encrypt(0, &mut buf, header_len);
+        let ciphertext = buf[header_len..].to_vec();
+
+        let mut payload = BytesMut::from(&buf[header_len..]);
+        bob_keys.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
+        assert_eq!(&payload[..], plaintext);
+
+        ciphertext
+    };
+
+    // Commit #1: epoch 1 -> 2.
+    let commit1 = alice_session.create_commit().unwrap();
+    bob_session.apply_commit(&commit1).unwrap();
+    let alice_epoch_a = alice_session.next_1rtt_keys().expect("keys after commit 1");
+    let bob_epoch_a = bob_session.next_1rtt_keys().expect("keys after commit 1");
+    let ciphertext_a = round_trip(&alice_epoch_a, &bob_epoch_a);
+
+    // Commit #2: epoch 2 -> 3.
+    let commit2 = alice_session.create_commit().unwrap();
+    bob_session.apply_commit(&commit2).unwrap();
+    let alice_epoch_b = alice_session.next_1rtt_keys().expect("keys after commit 2");
+    let bob_epoch_b = bob_session.next_1rtt_keys().expect("keys after commit 2");
+    let ciphertext_b = round_trip(&alice_epoch_b, &bob_epoch_b);
+
+    // Same plaintext, same packet number, two consecutive commits ->
+    // the derived keys must still be genuinely different.
+    assert_ne!(ciphertext_a, ciphertext_b);
+}
+#[test]
+fn next_1rtt_keys_reflects_new_generation_within_same_epoch() {
+   let alice = make_client("alice");
+        let bob = make_client("bob");
+
+        let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+        let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+        let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+        alice_group.apply_pending_commit().unwrap();
+        let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+        let mut alice_session = MlsSession::new(
+            Box::new(alice_group), Side::Client,
+            TransportParameters::read(Side::Client, &mut &[][..]).unwrap(),
+        );
+        let mut bob_session = MlsSession::new(
+            Box::new(bob_group), Side::Server,
+            TransportParameters::read(Side::Server, &mut &[][..]).unwrap(),
+        );
+
+    let alice_gen1 = alice_session.next_1rtt_keys().expect("gen 1 keys");
+    let bob_gen1   = bob_session.next_1rtt_keys().expect("gen 1 keys");
+    // round-trip encrypt/decrypt gen1, capture ciphertext (same header_len/plaintext/pn=0 pattern as the existing tests)
+    let header_len = 5;
+    let plaintext = b"epoch data";
+    let mut buf1 = vec![0u8; header_len + plaintext.len() + 16];        
+    buf1[..header_len].copy_from_slice(b"HDRXX");
+    buf1[header_len..header_len + plaintext.len()].copy_from_slice(plaintext);
+    alice_gen1.local.encrypt(0, &mut buf1, header_len);
+    let gen1_ciphertext = buf1[header_len..].to_vec();        
+    let mut payload1 = BytesMut::from(&buf1[header_len..]);
+    bob_gen1.remote.decrypt(0, &buf1[..header_len], &mut payload1).unwrap();
+    assert_eq!(&payload1[..], plaintext);
+    // NO commit here — same epoch, just call again:
+    let alice_gen2 = alice_session.next_1rtt_keys().expect("gen 2 keys");
+    let bob_gen2   = bob_session.next_1rtt_keys().expect("gen 2 keys");
+    // round-trip encrypt/decrypt gen2 cross-party, same plaintext + pn=0
+    let mut buf2 = vec![0u8; header_len + plaintext.len() + 16];        
+    buf2[..header_len].copy_from_slice(b"HDRXX");
+    buf2[header_len..header_len + plaintext.len()].copy_from_slice(plaintext);
+    alice_gen2.local.encrypt(0, &mut buf2, header_len);
+    let gen2_ciphertext = buf2[header_len..].to_vec();        
+    let mut payload2 = BytesMut::from(&buf2[header_len..]);
+    bob_gen2.remote.decrypt(0, &buf2[..header_len], &mut payload2).unwrap();
+    assert_eq!(&payload2[..], plaintext);
+    assert_ne!(gen1_ciphertext, gen2_ciphertext); // genuinely different key, same epoch
+}
+
 }

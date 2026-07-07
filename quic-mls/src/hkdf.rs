@@ -1,3 +1,8 @@
+// Reference 
+// RFC 9001 - from https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity
+//RFC 8446 - from https://www.rfc-editor.org/rfc/rfc8446.html#name-hkdf-expand-label
+
+
 use hkdf::Hkdf;
 use sha2::Sha256;
 
