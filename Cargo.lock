@@ -1959,6 +1959,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "testbed-runner"
+version = "0.1.0"
+dependencies = [
+ "mls-rs",
+ "mls-rs-crypto-rustcrypto",
+ "quic-mls",
+ "quinn",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
