@@ -16,8 +16,13 @@ async fn main() -> Result<(), Error> {
     let cert_bytes = std::fs::read("cert.der")?;
     let cert_der = CertificateDer::from(cert_bytes);
 
-    let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
-    let response = echo_client::echo(server_addr, cert_der, b"Hello, QUIC!").await?;
+    let server_addr: SocketAddr = std::env::args()
+    .nth(1)
+    .unwrap_or_else(|| "127.0.0.1:4433".to_string())
+    .parse()
+    .expect("invalid server address, expected form IP:PORT");
+
+let response = echo_client::echo(server_addr, cert_der, b"Hello, QUIC!").await?;
 
     println!("Echo: {}", String::from_utf8_lossy(&response));
     assert_eq!(response, b"Hello, QUIC!", "echo payload mismatch");

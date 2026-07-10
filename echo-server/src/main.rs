@@ -20,7 +20,13 @@ async fn main() -> Result<(), Error> {
     println!("cert.der written");
 
     let (server_config, _) = echo_server::make_server_config(&ck)?;
-    let addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+
+    let addr: SocketAddr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:4433".to_string())
+        .parse()
+        .expect("invalid bind address, expected form IP:PORT");
+
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
     println!("listening on {addr}");
 
