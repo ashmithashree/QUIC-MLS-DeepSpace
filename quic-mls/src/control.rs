@@ -51,11 +51,12 @@ pub async fn read_message(recv: &mut quinn::RecvStream) -> std::io::Result<Contr
     }
 }
 use tokio::io::AsyncWriteExt;
-pub async fn write_message(send: &mut quinn::SendStream, msg: &ControlMessage) -> std::io::Result<()>{
+pub async fn write_message(send: &mut quinn::SendStream, msg: &ControlMessage) -> std::io::Result<usize>{
     let bytes=encode(msg);
+    let n = bytes.len();
     send.write_all(&bytes).await?;
     send.flush().await?;
-    Ok(())
+    Ok(n)
 }
 
 use crate::group::{CommitLog, ExportSecret, apply_commit_window};
@@ -64,26 +65,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Sender-side helper: reads the current commit window, sends it, then waits up to
-/// `timeout` for a Report from the peer. On a successful Report, trims the log.
+/// timeout for a Report from the peer. On a successful Report, trims the log.
 /// On timeout or error, the window is left untrimmed so it will be resent next cycle.
+/// Returns the number of bytes sent in the CommitWindow message (0 if the window
+/// was empty and nothing was sent), for security-budget accounting.
 pub async fn send_window_and_trim<G: ExportSecret>(
     commit_log: &Arc<Mutex<CommitLog<G>>>,
     ctrl_send: &mut quinn::SendStream,
     ctrl_recv: &mut quinn::RecvStream,
     timeout: Duration,
-) -> std::io::Result<()> {
+) -> std::io::Result<usize> {
     let window = commit_log.lock().unwrap().window_bytes();
     if window.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
-    write_message(ctrl_send, &ControlMessage::CommitWindow(window)).await?;
+    let bytes_sent = write_message(ctrl_send, &ControlMessage::CommitWindow(window)).await?;
     match tokio::time::timeout(timeout, read_message(ctrl_recv)).await {
         Ok(Ok(ControlMessage::Report(k))) => {
             commit_log.lock().unwrap().trim(k);
         }
         _ => {} // timeout or error: leave untrimmed, will retry next cycle
     }
-    Ok(())
+    Ok(bytes_sent)
 }
 
 /// Receiver-side helper: loops reading CommitWindow messages, applying them, and
