@@ -34,7 +34,16 @@ pub fn make_server_config(
     let key_pem = ck.signing_key.serialize_pem();
     let key_der: PrivateKeyDer<'static> =
         rustls_pemfile::private_key(&mut key_pem.as_bytes())?.ok_or(Error::NoPrivateKey)?;
-    let server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], key_der)?;
+    let mut server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], key_der)?;
+
+    // WSL2's veth driver falsely reports GSO (Generic Segmentation Offload)
+    // support at runtime, causing quinn-udp's sendmsg calls to fail silently
+    // (EIO/EINVAL) with zero bytes transmitted. Disabling GSO explicitly
+    // avoids this; see https://github.com/quinn-rs/quinn/issues/2399.
+    let mut transport = quinn::TransportConfig::default();
+    transport.enable_segmentation_offload(false);
+    server_config.transport = std::sync::Arc::new(transport);
+
     Ok((server_config, cert_der))
 }
 
