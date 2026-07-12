@@ -205,6 +205,7 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let endpoint = Endpoint::server(server_config, args.bind_addr)?;
+    std::fs::write(args.bootstrap_dir.join("bob_ready.bin"), b"1").unwrap();
     let mut out = Telemetry::open(&args.out_path, mode).await?;
 
     let t0 = Instant::now();
@@ -252,6 +253,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut endpoint = Endpoint::client(args.bind_addr)?;
+    wait_for_file(&args.bootstrap_dir.join("bob_ready.bin"), Duration::from_millis(20)).await;
     endpoint.set_default_client_config(client_config);
 
     let mut out = Telemetry::open(&args.out_path, mode).await?;
