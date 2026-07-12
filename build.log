@@ -1,0 +1,18 @@
+   Compiling ring v0.17.14
+   Compiling aws-lc-rs v1.17.0
+   Compiling tracing-attributes v0.1.31
+   Compiling rustls-pemfile v2.2.0
+   Compiling mls-demo v0.1.0 (/home/ashmi/QUIC-MLS-DeepSpace/mls-demo)
+   Compiling tracing v0.1.44
+   Compiling quinn-udp v0.5.14
+   Compiling tracing-subscriber v0.3.23
+   Compiling rustls-webpki v0.103.13
+   Compiling rcgen v0.14.8
+   Compiling rustls v0.23.40
+   Compiling rustls-platform-verifier v0.6.2
+   Compiling quinn-proto v0.11.14
+   Compiling quinn v0.11.9
+   Compiling echo-client v0.1.0 (/home/ashmi/QUIC-MLS-DeepSpace/echo-client)
+   Compiling echo-server v0.1.0 (/home/ashmi/QUIC-MLS-DeepSpace/echo-server)
+   Compiling quic-mls v0.1.0 (/home/ashmi/QUIC-MLS-DeepSpace/quic-mls)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.02s
