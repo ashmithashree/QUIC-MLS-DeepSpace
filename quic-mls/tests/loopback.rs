@@ -307,6 +307,72 @@ async fn quic_mls_loopback_0rtt_echo() {
     // a broken server-side key.
     assert!(zero_rtt_accepted.await, "server must accept the 0-RTT data");
 }
+
+// Regression test for the write_handshake() epoch race: before the fix,
+// derive_mls_keys(self.group.as_ref(), ...) inside write_handshake() read
+// whatever epoch the group was CURRENTLY on, live, with no synchronization
+// against the app. Reproduces the exact sequence that broke testbed-runner
+// under --zero-rtt: the app calls create_commit() on the shared group
+// immediately after into_0rtt() returns, before the connection has
+// confirmed and before Bob has any chance to apply anything. With keys
+// pinned at MlsSession construction, the racing commit must not affect the
+// already-derived Handshake/1-RTT keys, and the connection must still
+// complete and decrypt correctly on both sides.
+#[tokio::test]
+async fn quic_mls_0rtt_create_commit_race_before_handshake_confirms() {
+    init_tracing();
+    let alice = make_client("alice");
+    let bob = make_client("bob");
+
+    let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+    alice_group.apply_pending_commit().unwrap();
+    let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+    // Shared: MlsClientConfig gets one Arc clone (used internally to pin
+    // this side's handshake/1-RTT keys), the test keeps another to race a
+    // create_commit() against that pinning.
+    let alice_group = Arc::new(Mutex::new(alice_group));
+
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(bob_group))));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(Arc::clone(&alice_group)))));
+
+    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let incoming = server.accept().await.expect("client connected").accept().expect("accept");
+        let (conn, _established) = incoming.into_0rtt().unwrap_or_else(|_| unreachable!());
+        let (mut send, mut recv) = conn.accept_bi().await.expect("client opened a stream");
+        let data = recv.read_to_end(1 << 16).await.expect("read request");
+        send.write_all(&data).await.expect("write response");
+        send.finish().expect("finish response stream");
+        conn.closed().await;
+    });
+
+    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    let (conn, zero_rtt_accepted) = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .into_0rtt()
+        .unwrap_or_else(|_| panic!("0-RTT keys must be available from the shared MLS epoch"));
+
+    // The race: advance Alice's epoch immediately, before the connection
+    // has confirmed and before Bob has any chance to apply anything.
+    alice_group.lock().unwrap().create_commit().unwrap();
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"Hello after a racing commit!").await.unwrap();
+    send.finish().unwrap();
+
+    let response = recv.read_to_end(64).await.unwrap();
+    assert_eq!(response, b"Hello after a racing commit!");
+
+    assert!(zero_rtt_accepted.await, "connection must still complete despite the racing commit");
+}
 //---------------------------------------Acceptance tests for Quic MLS-------------------------------------------------------------------
 // this is a bidirectional stream that is opened first on both sides of the connection and is used to send commit windows and reports between the client and server.
 

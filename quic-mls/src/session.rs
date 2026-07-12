@@ -63,24 +63,38 @@ pub struct MlsSession {
     // synthetic_cached_peer_params for why this exists.
     cached_peer_params: Option<TransportParameters>,
     key_update_generation: u64,
+    pinned_handshake_keys: Option<Keys>,
+    pinned_one_rtt_keys: Option<Keys>,
 }
 
 impl MlsSession {
     pub fn new(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
+        let pinned_handshake_keys = derive_mls_keys(group.as_ref(), "handshake", side, b"")
+            .expect("MLS group must have a valid epoch exporter secret");
+        let pinned_one_rtt_keys = derive_mls_keys(group.as_ref(), "1-rtt", side, b"")
+            .expect("MLS group must have a valid epoch exporter secret");
         Self {
             group, side, state: HsState::Initial, local_params,
             peer_params: None, early_data: false, cached_peer_params: None, key_update_generation: 0,
+            pinned_handshake_keys: Some(pinned_handshake_keys),
+            pinned_one_rtt_keys: Some(pinned_one_rtt_keys),
         }
     }
 
     // Like new, but offers 0-RTT keys derived from the group's current
-    // epoch secret, on the assumption the peer already shares that epoch 
+    // epoch secret, on the assumption the peer already shares that epoch
     // the MLS analogue of resuming from a TLS session ticket.
     pub fn new_with_early_data(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
+        let pinned_handshake_keys = derive_mls_keys(group.as_ref(), "handshake", side, b"")
+            .expect("MLS group must have a valid epoch exporter secret");
+        let pinned_one_rtt_keys = derive_mls_keys(group.as_ref(), "1-rtt", side, b"")
+            .expect("MLS group must have a valid epoch exporter secret");
         let cached_peer_params = (side == Side::Client).then(|| synthetic_cached_peer_params(side));
         Self {
             group, side, state: HsState::Initial, local_params,
             peer_params: None, early_data: true, cached_peer_params,key_update_generation: 0,
+            pinned_handshake_keys: Some(pinned_handshake_keys),
+            pinned_one_rtt_keys: Some(pinned_one_rtt_keys),
         }
     }
 
@@ -172,14 +186,12 @@ impl Session for MlsSession {
                     return None;
                 }
                 self.state = HsState::AwaitingOneRttKeys;
-                Some(derive_mls_keys(self.group.as_ref(), "handshake", self.side, b"")
-                    .expect("MLS group must have a valid epoch exporter secret"))
+                self.pinned_handshake_keys.take()
             }
             HsState::AwaitingOneRttKeys => {
                 buf.push(0);
                 self.state = HsState::Done;
-                Some(derive_mls_keys(self.group.as_ref(), "1-rtt", self.side, b"")
-                    .expect("MLS group must have a valid epoch exporter secret"))
+                self.pinned_one_rtt_keys.take()
             }
             HsState::Done => None,
         }
