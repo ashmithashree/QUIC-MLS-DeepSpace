@@ -213,13 +213,17 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let conn = if args.zero_rtt {
         let connecting = incoming.accept()?;
-        let (conn, zero_rtt_accepted) = connecting
+        // Deliberately not awaiting the ZeroRttAccepted future here: per
+        // quinn-proto's own source, the `accepted_0rtt` flag it resolves
+        // from is only ever written on the client side -- on the server
+        // it's initialized false and never touched again, so awaiting it
+        // here can hang forever instead of telling us anything. is_0rtt()
+        // on the stream we actually receive (below) is the real signal;
+        // see the caveat already noted in session.rs's early_data_accepted.
+        let (conn, _zero_rtt_accepted) = connecting
             .into_0rtt()
             .unwrap_or_else(|_| panic!("0-RTT keys not available"));
         out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-        let ok = zero_rtt_accepted.await;
-        let event = if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" };
-        out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
         conn
     } else {
         let conn = incoming.await?;
@@ -228,6 +232,8 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (send, recv) = conn.accept_bi().await?;
+    let is_0rtt = recv.is_0rtt();
+out.row(if is_0rtt { "control_stream_0rtt" } else { "control_stream_1rtt" }, 0, 0, 0.0).await?;
     let should_report = Arc::new(AtomicBool::new(true));
     tokio::spawn(run_commit_receiver(Arc::clone(&bob_group), send, recv, should_report));
 
@@ -261,22 +267,36 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let t0 = Instant::now();
     let connecting = endpoint.connect(peer_addr, "localhost")?;
 
-    let conn = if args.zero_rtt {
+    let (conn, zero_rtt_accepted) = if args.zero_rtt {
         let (conn, zero_rtt_accepted) = connecting
             .into_0rtt()
             .unwrap_or_else(|_| panic!("0-RTT keys not available"));
         out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-        let ok = zero_rtt_accepted.await;
-        let event = if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" };
-        out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-        conn
+        (conn, Some(zero_rtt_accepted))
     } else {
         let conn = connecting.await?;
         out.row("handshake", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-        conn
+        (conn, None)
     };
 
     let (mut send, mut recv) = conn.open_bi().await?;
+
+    // NOT calling create_commit() until the handshake has actually settled:
+    // MlsSession derives its "handshake"/"1-rtt" keys from this same live,
+    // shared group (see session.rs write_handshake), on quinn's internal
+    // background driver, asynchronously and without any lock against the
+    // app. If create_commit() advances the group to a new epoch before that
+    // background derivation finishes reading the old one, Alice's handshake
+    // keys stop matching Bob's -- the connection can never decrypt anything
+    // again (confirmed live: an unrecoverable "failed to authenticate
+    // packet" retry storm). Awaiting zero_rtt_accepted is safe *here*
+    // because, per quinn-proto, it's only ever driven meaningfully on the
+    // client; Bob (the server) must not wait on his own copy (see run_bob).
+    if let Some(zero_rtt_accepted) = zero_rtt_accepted {
+        let ok = zero_rtt_accepted.await;
+        let event = if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" };
+        out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+    }
 
     let start = Instant::now();
     let mut ticker = tokio::time::interval(args.commit_interval);
