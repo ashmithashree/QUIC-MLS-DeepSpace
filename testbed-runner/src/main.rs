@@ -14,7 +14,7 @@ use mls_rs::{
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use quic_mls::{run_commit_receiver, send_window_and_trim, CommitLog, ExportSecret, MlsClientConfig, MlsServerConfig};
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use tokio::io::AsyncWriteExt;
 
 const CS: CipherSuite = CipherSuite::CURVE25519_AES128;
@@ -34,6 +34,9 @@ struct Args {
     duration: Duration,
     out_path: PathBuf,
     zero_rtt: bool,
+    blackout_on: Duration,
+    blackout_off: Duration,
+    report_timeout: Duration,
 }
 
 fn parse_args() -> Args {
@@ -45,6 +48,9 @@ fn parse_args() -> Args {
     let mut duration = Duration::from_secs(120);
     let mut out_path = PathBuf::from("testbed-runner.csv");
     let mut zero_rtt = false;
+    let mut blackout_on = Duration::from_secs(0);
+    let mut blackout_off = Duration::from_secs(0);
+    let mut report_timeout = Duration::from_secs(10);
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -82,6 +88,18 @@ fn parse_args() -> Args {
             "--zero-rtt" => {
                 zero_rtt = true;
             }
+            "--blackout-on-secs" => {
+                let v = args.next().expect("--blackout-on-secs requires a value");
+                blackout_on = Duration::from_secs(v.parse().expect("bad --blackout-on-secs"));
+            }
+            "--blackout-off-secs" => {
+                let v = args.next().expect("--blackout-off-secs requires a value");
+                blackout_off = Duration::from_secs(v.parse().expect("bad --blackout-off-secs"));
+            }
+            "--report-timeout-secs" => {
+                let v = args.next().expect("--report-timeout-secs requires a value");
+                report_timeout = Duration::from_secs(v.parse().expect("bad --report-timeout-secs"));
+            }
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -95,7 +113,16 @@ fn parse_args() -> Args {
         duration,
         out_path,
         zero_rtt,
+        blackout_on,
+        blackout_off,
+        report_timeout,
     }
+}
+
+fn transport_config(idle: Duration) -> Arc<TransportConfig> {
+    let mut cfg = TransportConfig::default();
+    cfg.max_idle_timeout(Some(IdleTimeout::try_from(idle).unwrap()));
+    Arc::new(cfg)
 }
 
 struct Telemetry {
@@ -152,6 +179,19 @@ async fn wait_for_file(path: &Path, poll: Duration) -> Vec<u8> {
     }
 }
 
+async fn wait_for_ready(path: &Path, after: u64, poll: Duration) -> u64 {
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if let Ok(c) = s.trim().parse::<u64>() {
+                if c > after {
+                    return c;
+                }
+            }
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 async fn bootstrap_bob(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
     std::fs::create_dir_all(dir).unwrap();
     let kp_path = dir.join("bob_kp.bin");
@@ -196,50 +236,74 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let bob_group = Arc::new(Mutex::new(bob_group));
 
     let mode = if args.zero_rtt { "0rtt" } else { "1rtt" };
-    let server_config = if args.zero_rtt {
-        ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(Arc::clone(
-            &bob_group,
-        )))))
-    } else {
-        ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(Arc::clone(&bob_group)))))
-    };
-
-    let endpoint = Endpoint::server(server_config, args.bind_addr)?;
-    std::fs::write(args.bootstrap_dir.join("bob_ready.bin"), b"1").unwrap();
     let mut out = Telemetry::open(&args.out_path, mode).await?;
+    let ready_path = args.bootstrap_dir.join("bob_ready.bin");
 
-    let t0 = Instant::now();
-    let incoming = endpoint.accept().await.ok_or("no incoming connection")?;
+    let scenario_start = Instant::now();
+    let mut cycle: u64 = 0;
+    let local_epoch = Arc::new(Mutex::new(0u64));
 
-    let conn = if args.zero_rtt {
-        let connecting = incoming.accept()?;
-        // Deliberately not awaiting the ZeroRttAccepted future here: per
-        // quinn-proto's own source, the `accepted_0rtt` flag it resolves
-        // from is only ever written on the client side -- on the server
-        // it's initialized false and never touched again, so awaiting it
-        // here can hang forever instead of telling us anything. is_0rtt()
-        // on the stream we actually receive (below) is the real signal;
-        // see the caveat already noted in session.rs's early_data_accepted.
-        let (conn, _zero_rtt_accepted) = connecting
-            .into_0rtt()
-            .unwrap_or_else(|_| panic!("0-RTT keys not available"));
-        out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-        conn
-    } else {
-        let conn = incoming.await?;
-        out.row("handshake", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-        conn
-    };
+    while scenario_start.elapsed() < args.duration {
+        let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
+        let mut server_config = if args.zero_rtt {
+            ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(Arc::clone(
+                &bob_group,
+            )))))
+        } else {
+            ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(Arc::clone(&bob_group)))))
+        };
+        server_config.transport_config(transport_config(idle));
 
-    let (send, recv) = conn.accept_bi().await?;
-    let is_0rtt = recv.is_0rtt();
-out.row(if is_0rtt { "control_stream_0rtt" } else { "control_stream_1rtt" }, 0, 0, 0.0).await?;
-    let should_report = Arc::new(AtomicBool::new(true));
-    tokio::spawn(run_commit_receiver(Arc::clone(&bob_group), send, recv, should_report));
+        let endpoint = Endpoint::server(server_config, args.bind_addr)?;
+        cycle += 1;
+        std::fs::write(&ready_path, format!("{cycle}")).unwrap();
 
-    tokio::time::sleep(args.duration).await;
+        let remaining = args.duration.saturating_sub(scenario_start.elapsed());
+        let t0 = Instant::now();
+        let incoming = match tokio::time::timeout(remaining + Duration::from_secs(30), endpoint.accept()).await {
+            Ok(Some(incoming)) => incoming,
+            _ => break,
+        };
+
+        let conn = if args.zero_rtt {
+            let connecting = incoming.accept()?;
+            let (conn, zero_rtt_accepted) = connecting
+                .into_0rtt()
+                .unwrap_or_else(|_| panic!("0-RTT keys not available"));
+            out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+            let ok = zero_rtt_accepted.await;
+            out.row(if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" }, 0, 0, t0.elapsed().as_secs_f64() * 1000.0)
+                .await?;
+            conn
+        } else {
+            let conn = incoming.await?;
+            let event = if cycle == 1 { "handshake" } else { "reconnect_handshake" };
+            out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+            conn
+        };
+
+        let (send, recv) = conn.accept_bi().await?;
+        let is_0rtt = recv.is_0rtt();
+        out.row(if is_0rtt { "control_stream_0rtt" } else { "control_stream_1rtt" }, 0, 0, 0.0).await?;
+
+        let should_report = Arc::new(AtomicBool::new(true));
+        let recv_task = tokio::spawn(run_commit_receiver(
+            Arc::clone(&bob_group),
+            send,
+            recv,
+            should_report,
+            Arc::clone(&local_epoch),
+        ));
+
+        let _ = conn.closed().await;
+        recv_task.abort();
+
+        if args.blackout_off.is_zero() {
+            break;
+        }
+    }
+
     out.row("done", 0, 0, 0.0).await?;
-    conn.close(0u32.into(), b"done");
     Ok(())
 }
 
@@ -250,78 +314,111 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let alice_group = Arc::new(Mutex::new(CommitLog::new(alice_group)));
 
     let mode = if args.zero_rtt { "0rtt" } else { "1rtt" };
-    let client_config = if args.zero_rtt {
-        ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(Arc::clone(
-            &alice_group,
-        )))))
-    } else {
-        ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)))))
-    };
-
-    let mut endpoint = Endpoint::client(args.bind_addr)?;
-    wait_for_file(&args.bootstrap_dir.join("bob_ready.bin"), Duration::from_millis(20)).await;
-    endpoint.set_default_client_config(client_config);
-
     let mut out = Telemetry::open(&args.out_path, mode).await?;
+    let ready_path = args.bootstrap_dir.join("bob_ready.bin");
 
-    let t0 = Instant::now();
-    let connecting = endpoint.connect(peer_addr, "localhost")?;
-
-    let (conn, zero_rtt_accepted) = if args.zero_rtt {
-        let (conn, zero_rtt_accepted) = connecting
-            .into_0rtt()
-            .unwrap_or_else(|_| panic!("0-RTT keys not available"));
-        out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-        (conn, Some(zero_rtt_accepted))
-    } else {
-        let conn = connecting.await?;
-        out.row("handshake", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-        (conn, None)
-    };
-
-    let (mut send, mut recv) = conn.open_bi().await?;
-
-    // NOT calling create_commit() until the handshake has actually settled:
-    // MlsSession derives its "handshake"/"1-rtt" keys from this same live,
-    // shared group (see session.rs write_handshake), on quinn's internal
-    // background driver, asynchronously and without any lock against the
-    // app. If create_commit() advances the group to a new epoch before that
-    // background derivation finishes reading the old one, Alice's handshake
-    // keys stop matching Bob's -- the connection can never decrypt anything
-    // again (confirmed live: an unrecoverable "failed to authenticate
-    // packet" retry storm). Awaiting zero_rtt_accepted is safe *here*
-    // because, per quinn-proto, it's only ever driven meaningfully on the
-    // client; Bob (the server) must not wait on his own copy (see run_bob).
-    if let Some(zero_rtt_accepted) = zero_rtt_accepted {
-        let ok = zero_rtt_accepted.await;
-        let event = if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" };
-        out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-    }
-
-    let start = Instant::now();
-    let mut ticker = tokio::time::interval(args.commit_interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let scenario_start = Instant::now();
     let mut epoch: u64 = 0;
+    let mut cycle: u64 = 0;
+    let mut last_ready_seen: u64 = 0;
 
-    while start.elapsed() < args.duration {
-        ticker.tick().await;
-        if start.elapsed() >= args.duration {
+    while scenario_start.elapsed() < args.duration {
+        let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
+        let mut client_config = if args.zero_rtt {
+            ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(Arc::clone(
+                &alice_group,
+            )))))
+        } else {
+            ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)))))
+        };
+        client_config.transport_config(transport_config(idle));
+        let mut endpoint = Endpoint::client(args.bind_addr)?;
+        endpoint.set_default_client_config(client_config);
+
+        last_ready_seen = wait_for_ready(&ready_path, last_ready_seen, Duration::from_millis(20)).await;
+
+        cycle += 1;
+        let t0 = Instant::now();
+        let connecting = endpoint.connect(peer_addr, "localhost")?;
+
+        let conn = if args.zero_rtt {
+            let (conn, zero_rtt_accepted) = connecting
+                .into_0rtt()
+                .unwrap_or_else(|_| panic!("0-RTT keys not available"));
+            out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+            let ok = zero_rtt_accepted.await;
+            out.row(if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" }, 0, 0, t0.elapsed().as_secs_f64() * 1000.0)
+                .await?;
+            conn
+        } else {
+            let conn = connecting.await?;
+            let event = if cycle == 1 { "handshake" } else { "reconnect_handshake" };
+            out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+            conn
+        };
+
+        let (mut send, mut recv) = conn.open_bi().await?;
+
+        if cycle > 1 {
+            let t_flush = Instant::now();
+            let bytes_sent = send_window_and_trim(&alice_group, &mut send, &mut recv, args.report_timeout).await?;
+            out.row("blackout_recovery_flush", epoch, bytes_sent as u64, t_flush.elapsed().as_secs_f64() * 1000.0)
+                .await?;
+        }
+
+        let phase_start = Instant::now();
+        let on_duration = if args.blackout_on.is_zero() {
+            args.duration.saturating_sub(scenario_start.elapsed())
+        } else {
+            args.blackout_on
+        };
+
+        let mut ticker = tokio::time::interval(args.commit_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        while phase_start.elapsed() < on_duration && scenario_start.elapsed() < args.duration {
+            ticker.tick().await;
+            if phase_start.elapsed() >= on_duration || scenario_start.elapsed() >= args.duration {
+                break;
+            }
+
+            let t1 = Instant::now();
+            alice_group.lock().unwrap().create_commit().unwrap();
+            epoch += 1;
+
+            let bytes_sent = send_window_and_trim(&alice_group, &mut send, &mut recv, args.report_timeout).await?;
+            conn.force_key_update();
+
+            let ms = t1.elapsed().as_secs_f64() * 1000.0;
+            out.row("commit", epoch, bytes_sent as u64, ms).await?;
+        }
+
+        conn.close(0u32.into(), b"blackout");
+
+        if args.blackout_off.is_zero() || scenario_start.elapsed() >= args.duration {
             break;
         }
 
-        let t1 = Instant::now();
-        alice_group.lock().unwrap().create_commit().unwrap();
-        epoch += 1;
+        out.row("blackout_start", epoch, 0, 0.0).await?;
 
-        let bytes_sent = send_window_and_trim(&alice_group, &mut send, &mut recv, Duration::from_secs(5)).await?;
-        conn.force_key_update();
+        let blackout_start = Instant::now();
+        let mut bo_ticker = tokio::time::interval(args.commit_interval);
+        bo_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        let ms = t1.elapsed().as_secs_f64() * 1000.0;
-        out.row("commit", epoch, bytes_sent as u64, ms).await?;
+        while blackout_start.elapsed() < args.blackout_off && scenario_start.elapsed() < args.duration {
+            bo_ticker.tick().await;
+            if blackout_start.elapsed() >= args.blackout_off || scenario_start.elapsed() >= args.duration {
+                break;
+            }
+            alice_group.lock().unwrap().create_commit().unwrap();
+            epoch += 1;
+            out.row("commit_offline", epoch, 0, 0.0).await?;
+        }
+
+        out.row("blackout_end", epoch, 0, 0.0).await?;
     }
 
     out.row("done", epoch, 0, 0.0).await?;
-    conn.close(0u32.into(), b"done");
     Ok(())
 }
 

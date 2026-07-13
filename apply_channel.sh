@@ -64,10 +64,17 @@ case "$PROFILE" in
 esac
 
 sudo ip netns exec "$NS" tc qdisc del dev "$IFACE" root 2>/dev/null || true
-sudo ip netns exec "$NS" tc qdisc add dev "$IFACE" root netem \
-    delay "$DELAY" "$JITTER" distribution normal \
-    rate "$RATE" \
-    loss "$LOSS"
+if [ "$JITTER" = "0ms" ]; then
+    sudo ip netns exec "$NS" tc qdisc add dev "$IFACE" root netem \
+        delay "$DELAY" \
+        rate "$RATE" \
+        loss "$LOSS"
+else
+    sudo ip netns exec "$NS" tc qdisc add dev "$IFACE" root netem \
+        delay "$DELAY" "$JITTER" distribution normal \
+        rate "$RATE" \
+        loss "$LOSS"
+fi
 
 echo "applied $PROFILE to $IFACE in $NS: delay=$DELAY±$JITTER rate=$RATE loss=$LOSS"
 sudo ip netns exec "$NS" tc qdisc show dev "$IFACE"
