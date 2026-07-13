@@ -242,20 +242,30 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let scenario_start = Instant::now();
     let mut cycle: u64 = 0;
     let local_epoch = Arc::new(Mutex::new(0u64));
+    let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
 
-    while scenario_start.elapsed() < args.duration {
-        let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
-        let mut server_config = if args.zero_rtt {
+    // MlsServerConfig is single-use (start_session takes ownership of the group
+    // once), so a fresh one is required for every connection -- but the Endpoint
+    // itself (and its bound UDP socket) is reused across reconnects.
+    let make_server_config = |zero_rtt: bool, idle: Duration| {
+        let mut cfg = if zero_rtt {
             ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(Arc::clone(
                 &bob_group,
             )))))
         } else {
             ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(Arc::clone(&bob_group)))))
         };
-        server_config.transport_config(transport_config(idle));
+        cfg.transport_config(transport_config(idle));
+        cfg
+    };
 
-        let endpoint = Endpoint::server(server_config, args.bind_addr)?;
+    let endpoint = Endpoint::server(make_server_config(args.zero_rtt, idle), args.bind_addr)?;
+
+    while scenario_start.elapsed() < args.duration {
         cycle += 1;
+        if cycle > 1 {
+            endpoint.set_server_config(Some(make_server_config(args.zero_rtt, idle)));
+        }
         std::fs::write(&ready_path, format!("{cycle}")).unwrap();
 
         let remaining = args.duration.saturating_sub(scenario_start.elapsed());
@@ -322,24 +332,31 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut cycle: u64 = 0;
     let mut last_ready_seen: u64 = 0;
 
-    while scenario_start.elapsed() < args.duration {
-        let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
-        let mut client_config = if args.zero_rtt {
+    let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
+
+    // MlsClientConfig is single-use (start_session takes ownership of the group
+    // once), so a fresh one is required for every connection -- but the Endpoint
+    // itself (and its bound UDP socket) is reused across reconnects.
+    let make_client_config = |zero_rtt: bool, idle: Duration| {
+        let mut cfg = if zero_rtt {
             ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(Arc::clone(
                 &alice_group,
             )))))
         } else {
             ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)))))
         };
-        client_config.transport_config(transport_config(idle));
-        let mut endpoint = Endpoint::client(args.bind_addr)?;
-        endpoint.set_default_client_config(client_config);
+        cfg.transport_config(transport_config(idle));
+        cfg
+    };
 
+    let endpoint = Endpoint::client(args.bind_addr)?;
+
+    while scenario_start.elapsed() < args.duration {
         last_ready_seen = wait_for_ready(&ready_path, last_ready_seen, Duration::from_millis(20)).await;
 
         cycle += 1;
         let t0 = Instant::now();
-        let connecting = endpoint.connect(peer_addr, "localhost")?;
+        let connecting = endpoint.connect_with(make_client_config(args.zero_rtt, idle), peer_addr, "localhost")?;
 
         let conn = if args.zero_rtt {
             let (conn, zero_rtt_accepted) = connecting

@@ -143,7 +143,7 @@ async fn quic_mls_loopback_echo_with_rekey() {
         //handle commit window and send report in seperate task
         let bob_group_ctrl = Arc::clone(&bob_group);
         let always_report = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, always_report));
+        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, always_report, Arc::new(Mutex::new(0u64))));
         //echo loop for all application data stream.
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             let data = recv.read_to_end(1 << 16).await.expect("read request");
@@ -390,7 +390,7 @@ async fn quic_mls_single_blackout_no_report(){
         let (ctrl_send, ctrl_recv) = conn.accept_bi().await.expect("control stream");
         let bob_group_ctrl = Arc::clone(&bob_group);
         let no_report = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, no_report));
+        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, no_report, Arc::new(Mutex::new(0u64))));
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             let data = recv.read_to_end(1 << 16).await.expect("read request");
             send.write_all(&data).await.expect("write response");
@@ -424,7 +424,7 @@ async fn quic_mls_single_blackout_with_report(){
         let (ctrl_send, ctrl_recv) = conn.accept_bi().await.expect("control stream");
         let bob_group_ctrl = Arc::clone(&bob_group);
         let always_report = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, always_report));
+        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, always_report, Arc::new(Mutex::new(0u64))));
     });
     let (conn, mut ctrl_send, mut ctrl_recv) = connect_with_control(client_config, server_addr).await;
     // Blackout: Alice creates 3 commits.
@@ -454,7 +454,7 @@ async fn quic_mls_two_blackouts(){
         // First bi stream is the control stream.
         let (ctrl_send, ctrl_recv) = conn.accept_bi().await.expect("control stream");
         let bob_group_ctrl = Arc::clone(&bob_group);
-        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, should_report_ctrl));
+        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, should_report_ctrl, Arc::new(Mutex::new(0u64))));
     });
     let (conn, mut ctrl_send, mut ctrl_recv) = connect_with_control(client_config, server_addr).await;
     // black out 1: Alice creates 2 commits and sends them to Bob, who applies them and sends a Report back.
