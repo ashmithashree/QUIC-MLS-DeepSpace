@@ -246,8 +246,8 @@ async fn quic_mls_loopback_0rtt_echo() {
     alice_group.apply_pending_commit().unwrap();
     let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
 
-    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(bob_group))));
-    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(alice_group))));
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(bob_group))));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(alice_group))));
 
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
