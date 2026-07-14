@@ -380,13 +380,14 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
             let t1 = Instant::now();
             alice_group.lock().unwrap().create_commit().unwrap();
+            let cpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
             epoch += 1;
-
+            let t2 = Instant::now();
             let bytes_sent = send_window_and_trim(&alice_group, &mut send, &mut recv, args.report_timeout).await?;
             conn.force_key_update();
-
-            let ms = t1.elapsed().as_secs_f64() * 1000.0;
-            out.row("commit", epoch, bytes_sent as u64, ms).await?;
+            let net_ms = t2.elapsed().as_secs_f64() * 1000.0;
+            out.row("commit_cpu", epoch, 0, cpu_ms).await?;
+            out.row("commit_net", epoch, bytes_sent as u64, net_ms).await?;
         }
 
         conn.close(0u32.into(), b"blackout");
