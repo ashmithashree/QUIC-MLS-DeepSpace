@@ -1,0 +1,14 @@
+[package]
+name    = "testbed-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+quic-mls                 = { path = "../quic-mls" }
+quinn                    = { workspace = true }
+tokio                    = { workspace = true }
+thiserror                = { workspace = true }
+tracing                  = { workspace = true }
+tracing-subscriber       = { workspace = true }
+mls-rs                   = { workspace = true }
+mls-rs-crypto-rustcrypto = { workspace = true }

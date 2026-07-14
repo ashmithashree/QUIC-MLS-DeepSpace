@@ -64,11 +64,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Sender-side helper: reads the current commit window, sends it, then waits up to
-/// timeout for a Report from the peer. On a successful Report, trims the log.
-/// On timeout or error, the window is left untrimmed so it will be resent next cycle.
-/// Returns the number of bytes sent in the CommitWindow message (0 if the window
-/// was empty and nothing was sent), for security-budget accounting.
+
 pub async fn send_window_and_trim<G: ExportSecret>(
     commit_log: &Arc<Mutex<CommitLog<G>>>,
     ctrl_send: &mut quinn::SendStream,
@@ -89,26 +85,27 @@ pub async fn send_window_and_trim<G: ExportSecret>(
     Ok(bytes_sent)
 }
 
-/// Receiver-side helper: loops reading CommitWindow messages, applying them, and
-/// optionally sending Reports based on `should_report`. Returns when the stream closes.
+
 pub async fn run_commit_receiver<G: ExportSecret + 'static>(
     group: Arc<Mutex<G>>,
     mut ctrl_send: quinn::SendStream,
     mut ctrl_recv: quinn::RecvStream,
     should_report: Arc<AtomicBool>,
+    local_epoch: Arc<Mutex<u64>>,
 ) {
-    let mut local_epoch = 0u64;
     loop {
         match read_message(&mut ctrl_recv).await {
             Ok(ControlMessage::CommitWindow(w)) => {
-                {
+                let reported_epoch = {
                     let mut guard = group.lock().unwrap();
-                    if apply_commit_window(&mut *guard, &w, &mut local_epoch).is_err() {
+                    let mut epoch_guard = local_epoch.lock().unwrap();
+                    if apply_commit_window(&mut *guard, &w, &mut *epoch_guard).is_err() {
                         break;
                     }
-                }
+                    *epoch_guard
+                };
                 if should_report.load(Ordering::SeqCst) {
-                    if write_message(&mut ctrl_send, &ControlMessage::Report(local_epoch))
+                    if write_message(&mut ctrl_send, &ControlMessage::Report(reported_epoch))
                         .await
                         .is_err()
                     {

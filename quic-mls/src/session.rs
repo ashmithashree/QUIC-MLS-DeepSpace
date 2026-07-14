@@ -118,9 +118,8 @@ impl Session for MlsSession {
                 if self.peer_params.is_none() {
                     return None;
                 }
-                self.state = HsState::ConfirmingZeroRttKeys;
-                Some(derive_mls_keys(self.group.as_ref(), "0-rtt", self.side, b"")
-                    .expect("MLS group must have a valid epoch exporter secret"))
+                self.state = HsState::AwaitingZeroRttKeys;
+                self.pinned_zero_rtt_keys.take()
             }
             // Pushes one dummy byte to buf so quinn-proto has real CRYPTO
             // frame content to send at the (now former) Handshake level,
