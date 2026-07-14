@@ -2,6 +2,7 @@
 pub enum ControlMessage{
     CommitWindow(Vec<(u64, Vec<u8>)>) ,
     Report(u64),
+    Hello,
 }
 
 fn encode(msg: &ControlMessage) -> Vec<u8>{
@@ -19,6 +20,9 @@ fn encode(msg: &ControlMessage) -> Vec<u8>{
         ControlMessage::Report(epoch) => {
             buf.push(0x02);
             buf.extend_from_slice(&epoch.to_be_bytes());
+        }
+        ControlMessage::Hello => {
+            buf.push(0x03);
         }
     }
     buf
@@ -47,6 +51,7 @@ pub async fn read_message(recv: &mut quinn::RecvStream) -> std::io::Result<Contr
             let epoch = recv.read_u64().await?;
             Ok(ControlMessage::Report(epoch))
         }
+        0x03 => Ok(ControlMessage::Hello),
         _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid message type")),
     }
 }
@@ -114,6 +119,7 @@ pub async fn run_commit_receiver<G: ExportSecret + 'static>(
                 }
             }
             Ok(ControlMessage::Report(_)) => {}
+            Ok(ControlMessage::Hello) => {}
             Err(_) => break,
         }
     }

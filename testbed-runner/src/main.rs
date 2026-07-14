@@ -13,7 +13,7 @@ use mls_rs::{
     CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList, MlsMessage,
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-use quic_mls::{run_commit_receiver, send_window_and_trim, CommitLog, ExportSecret, MlsClientConfig, MlsServerConfig};
+use quic_mls::{run_commit_receiver, send_window_and_trim, CommitLog, ExportSecret, MlsClientConfig, MlsServerConfig, ControlMessage, write_message,};
 use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
 use tokio::io::AsyncWriteExt;
 
@@ -340,6 +340,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         
         let (mut send, mut recv) = conn.open_bi().await?;
+        write_message(&mut send, &ControlMessage::Hello).await?;
         out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
 
         let ok = zero_rtt_accepted.await;
@@ -366,9 +367,13 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         let mut ticker = tokio::time::interval(args.commit_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
+        let deadline = std::cmp::min(scenario_start + args.duration, phase_start + on_duration);
+        
         while phase_start.elapsed() < on_duration && scenario_start.elapsed() < args.duration {
-            ticker.tick().await;
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = tokio::time::sleep_until(deadline.into()) => break,
+            }
             if phase_start.elapsed() >= on_duration || scenario_start.elapsed() >= args.duration {
                 break;
             }
@@ -395,9 +400,12 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let blackout_start = Instant::now();
         let mut bo_ticker = tokio::time::interval(args.commit_interval);
         bo_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
+        let bo_deadline = std::cmp::min(scenario_start + args.duration, blackout_start + args.blackout_off);
         while blackout_start.elapsed() < args.blackout_off && scenario_start.elapsed() < args.duration {
-            bo_ticker.tick().await;
+            tokio::select! {
+                _ = bo_ticker.tick() => {}
+                _ = tokio::time::sleep_until(bo_deadline.into()) => break,
+            }
             if blackout_start.elapsed() >= args.blackout_off || scenario_start.elapsed() >= args.duration {
                 break;
             }
