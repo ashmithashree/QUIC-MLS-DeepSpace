@@ -301,10 +301,10 @@ async fn quic_mls_loopback_0rtt_echo() {
 
     // Secondary: quinn-proto's own accepted_0rtt flag. Note this is driven
     // entirely by the CLIENT's early_data_accepted(), which in this Session
-    // is a static `Some(self.early_data)` policy flag -- it does not by
-    // itself prove the server decrypted anything (see early_data_accepted
-    // in session.rs). The assertion above is the one that actually catches
-    // a broken server-side key.
+    // is a static `Some(true)` policy flag since 0-RTT is the only mode --
+    // it does not by itself prove the server decrypted anything (see
+    // early_data_accepted in session.rs). The assertion above is the one
+    // that actually catches a broken server-side key.
     assert!(zero_rtt_accepted.await, "server must accept the 0-RTT data");
 }
 
@@ -335,8 +335,8 @@ async fn quic_mls_0rtt_create_commit_race_before_handshake_confirms() {
     // create_commit() against that pinning.
     let alice_group = Arc::new(Mutex::new(alice_group));
 
-    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(bob_group))));
-    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(Arc::clone(&alice_group)))));
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(bob_group))));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)))));
 
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();

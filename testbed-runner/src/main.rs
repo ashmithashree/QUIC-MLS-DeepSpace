@@ -33,7 +33,6 @@ struct Args {
     commit_interval: Duration,
     duration: Duration,
     out_path: PathBuf,
-    zero_rtt: bool,
     blackout_on: Duration,
     blackout_off: Duration,
     report_timeout: Duration,
@@ -47,7 +46,6 @@ fn parse_args() -> Args {
     let mut commit_interval = Duration::from_secs(30);
     let mut duration = Duration::from_secs(120);
     let mut out_path = PathBuf::from("testbed-runner.csv");
-    let mut zero_rtt = false;
     let mut blackout_on = Duration::from_secs(0);
     let mut blackout_off = Duration::from_secs(0);
     let mut report_timeout = Duration::from_secs(10);
@@ -85,9 +83,6 @@ fn parse_args() -> Args {
             "--out" => {
                 out_path = PathBuf::from(args.next().expect("--out requires a value"));
             }
-            "--zero-rtt" => {
-                zero_rtt = true;
-            }
             "--blackout-on-secs" => {
                 let v = args.next().expect("--blackout-on-secs requires a value");
                 blackout_on = Duration::from_secs(v.parse().expect("bad --blackout-on-secs"));
@@ -112,7 +107,6 @@ fn parse_args() -> Args {
         commit_interval,
         duration,
         out_path,
-        zero_rtt,
         blackout_on,
         blackout_off,
         report_timeout,
@@ -235,7 +229,7 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let bob_group = bootstrap_bob(&args.bootstrap_dir).await;
     let bob_group = Arc::new(Mutex::new(bob_group));
 
-    let mode = if args.zero_rtt { "0rtt" } else { "1rtt" };
+    let mode = "0rtt";
     let mut out = Telemetry::open(&args.out_path, mode).await?;
     let ready_path = args.bootstrap_dir.join("bob_ready.bin");
 
@@ -247,24 +241,20 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // MlsServerConfig is single-use (start_session takes ownership of the group
     // once), so a fresh one is required for every connection -- but the Endpoint
     // itself (and its bound UDP socket) is reused across reconnects.
-    let make_server_config = |zero_rtt: bool, idle: Duration| {
-        let mut cfg = if zero_rtt {
-            ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(Arc::clone(
-                &bob_group,
-            )))))
-        } else {
-            ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(Arc::clone(&bob_group)))))
-        };
+    let make_server_config = |idle: Duration| {
+        let mut cfg = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(Arc::clone(
+                &bob_group)))));
+            
         cfg.transport_config(transport_config(idle));
         cfg
     };
 
-    let endpoint = Endpoint::server(make_server_config(args.zero_rtt, idle), args.bind_addr)?;
+    let endpoint = Endpoint::server(make_server_config(idle), args.bind_addr)?;
 
     while scenario_start.elapsed() < args.duration {
         cycle += 1;
         if cycle > 1 {
-            endpoint.set_server_config(Some(make_server_config(args.zero_rtt, idle)));
+            endpoint.set_server_config(Some(make_server_config(idle)));
         }
         std::fs::write(&ready_path, format!("{cycle}")).unwrap();
 
@@ -274,27 +264,20 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             Ok(Some(incoming)) => incoming,
             _ => break,
         };
-
-        let conn = if args.zero_rtt {
-            let connecting = incoming.accept()?;
-            let (conn, zero_rtt_accepted) = connecting
+        let connecting = incoming.accept()?;
+        let (conn, zero_rtt_accepted) = connecting
                 .into_0rtt()
                 .unwrap_or_else(|_| panic!("0-RTT keys not available"));
-            out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-            let ok = zero_rtt_accepted.await;
-            out.row(if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" }, 0, 0, t0.elapsed().as_secs_f64() * 1000.0)
-                .await?;
-            conn
-        } else {
-            let conn = incoming.await?;
-            let event = if cycle == 1 { "handshake" } else { "reconnect_handshake" };
-            out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-            conn
-        };
 
+        
         let (send, recv) = conn.accept_bi().await?;
         let is_0rtt = recv.is_0rtt();
+
+        out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
         out.row(if is_0rtt { "control_stream_0rtt" } else { "control_stream_1rtt" }, 0, 0, 0.0).await?;
+        zero_rtt_accepted.await;
+        let event = if cycle == 1 { "handshake_confirmed" } else { "reconnect_handshake_confirmed" };
+        out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
 
         let should_report = Arc::new(AtomicBool::new(true));
         let recv_task = tokio::spawn(run_commit_receiver(
@@ -323,7 +306,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let alice_group = bootstrap_alice(&args.bootstrap_dir).await;
     let alice_group = Arc::new(Mutex::new(CommitLog::new(alice_group)));
 
-    let mode = if args.zero_rtt { "0rtt" } else { "1rtt" };
+    let mode = "0rtt";
     let mut out = Telemetry::open(&args.out_path, mode).await?;
     let ready_path = args.bootstrap_dir.join("bob_ready.bin");
 
@@ -334,17 +317,10 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
 
-    // MlsClientConfig is single-use (start_session takes ownership of the group
-    // once), so a fresh one is required for every connection -- but the Endpoint
-    // itself (and its bound UDP socket) is reused across reconnects.
-    let make_client_config = |zero_rtt: bool, idle: Duration| {
-        let mut cfg = if zero_rtt {
-            ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(Arc::clone(
-                &alice_group,
-            )))))
-        } else {
-            ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)))))
-        };
+    
+    let make_client_config = | idle: Duration| {
+        let mut cfg = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(
+                &alice_group,)))));
         cfg.transport_config(transport_config(idle));
         cfg
     };
@@ -356,25 +332,23 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         cycle += 1;
         let t0 = Instant::now();
-        let connecting = endpoint.connect_with(make_client_config(args.zero_rtt, idle), peer_addr, "localhost")?;
+        let connecting = endpoint.connect_with(make_client_config(idle), peer_addr, "localhost")?;
 
-        let conn = if args.zero_rtt {
-            let (conn, zero_rtt_accepted) = connecting
-                .into_0rtt()
-                .unwrap_or_else(|_| panic!("0-RTT keys not available"));
-            out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-            let ok = zero_rtt_accepted.await;
-            out.row(if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" }, 0, 0, t0.elapsed().as_secs_f64() * 1000.0)
-                .await?;
-            conn
-        } else {
-            let conn = connecting.await?;
-            let event = if cycle == 1 { "handshake" } else { "reconnect_handshake" };
-            out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
-            conn
-        };
+        let (conn, zero_rtt_accepted) = connecting
+            .into_0rtt()
+            .unwrap_or_else(|_| panic!("0-RTT keys not available"));
 
+        
         let (mut send, mut recv) = conn.open_bi().await?;
+        out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+
+        let ok = zero_rtt_accepted.await;
+        let event = if ok {
+            if cycle == 1 { "handshake_0rtt_accepted" } else { "reconnect_handshake_0rtt_accepted" }
+        } else {
+            if cycle == 1 { "handshake_0rtt_rejected" } else { "reconnect_handshake_0rtt_rejected" }
+        };
+        out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
 
         if cycle > 1 {
             let t_flush = Instant::now();

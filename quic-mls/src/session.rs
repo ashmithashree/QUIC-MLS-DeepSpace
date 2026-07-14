@@ -49,18 +49,22 @@ pub struct MlsSession {
     peer_params: Option<TransportParameters>,
     cached_peer_params: Option<TransportParameters>,
     key_update_generation: u64,
+    pinned_zero_rtt_upgrade_keys: Option<Keys>,
     pinned_zero_rtt_keys: Option<Keys>,
 }
 
 impl MlsSession {
 
     pub fn new(group: Box<dyn ExportSecret>, side: Side, local_params: TransportParameters) -> Self {
+        let pinned_zero_rtt_upgrade_keys = derive_mls_keys(group.as_ref(), "0-rtt", side, b"")
+            .expect("MLS group must have a valid epoch exporter secret");
         let pinned_zero_rtt_keys = derive_mls_keys(group.as_ref(), "0-rtt", side, b"")
             .expect("MLS group must have a valid epoch exporter secret");
         let cached_peer_params = (side == Side::Client).then(|| synthetic_cached_peer_params(side));
         Self {
             group, side, state: HsState::Initial, local_params,
             peer_params: None, cached_peer_params, key_update_generation: 0,
+            pinned_zero_rtt_upgrade_keys: Some(pinned_zero_rtt_upgrade_keys),
             pinned_zero_rtt_keys: Some(pinned_zero_rtt_keys),
         }
     }
@@ -118,8 +122,8 @@ impl Session for MlsSession {
                 if self.peer_params.is_none() {
                     return None;
                 }
-                self.state = HsState::AwaitingZeroRttKeys;
-                self.pinned_zero_rtt_keys.take()
+                self.state = HsState::ConfirmingZeroRttKeys;
+                self.pinned_zero_rtt_upgrade_keys.take()
             }
             // Pushes one dummy byte to buf so quinn-proto has real CRYPTO
             // frame content to send at the (now former) Handshake level,
@@ -260,8 +264,6 @@ mod handshake_key_tests {
         assert!(bob_session.transport_parameters().unwrap().is_some());
         assert!(alice_session.is_handshaking());
         assert!(bob_session.is_handshaking());
-
-    
         assert!(alice_session.write_handshake(&mut Vec::new()).is_some());
         assert!(bob_session.write_handshake(&mut Vec::new()).is_some());
         assert!(alice_session.is_handshaking());
