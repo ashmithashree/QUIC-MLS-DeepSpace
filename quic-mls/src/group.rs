@@ -12,6 +12,8 @@ pub trait ExportSecret: Send + Sync {
     fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError>;
     fn apply_commit(&mut self, commit: &[u8]) -> Result<(), mls_rs::error::MlsError>;
     fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError>;
+    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError>;
+    fn current_member_index(&self) -> u32;
 }
 // this calls the mls_rs::Group methods to export secrets, process_incoming_message and apply commits.
 impl<C: mls_rs::client_builder::MlsConfig> ExportSecret for mls_rs::Group<C> {
@@ -33,6 +35,14 @@ impl<C: mls_rs::client_builder::MlsConfig> ExportSecret for mls_rs::Group<C> {
         self.apply_pending_commit()?;
         commit_output.commit_message.to_bytes()
     }
+
+    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        Ok(self.group_info_message_allowing_ext_commit(with_tree)?.to_bytes()?)
+    }
+
+    fn current_member_index(&self) -> u32 {
+        mls_rs::Group::current_member_index(self)
+    }
 }
 //MlsClientConfig::new(Box::new(alice_group)) takes ownership of alice_group gets moved into the config, then into the live connection.  
 //Once that happens, test code has no way to reach it again but we need to do for rekey so this 
@@ -52,6 +62,14 @@ impl<G: ExportSecret> ExportSecret for Arc<Mutex<G>> {
     fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError> {
         self.lock().unwrap().create_commit()
     }
+
+    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        self.lock().unwrap().group_info_for_external_commit(with_tree)
+    }
+
+    fn current_member_index(&self) -> u32 {
+        self.lock().unwrap().current_member_index()
+    }
 }
 
 impl<G: ExportSecret> ExportSecret for CommitLog<G> {
@@ -68,7 +86,36 @@ impl<G: ExportSecret> ExportSecret for CommitLog<G> {
         self.commit_log.insert(self.current_epoch, bytes.clone());
         Ok(bytes)
     }
-    
+
+    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        self.inner.group_info_for_external_commit(with_tree)
+    }
+
+    fn current_member_index(&self) -> u32 {
+        self.inner.current_member_index()
+    }
+}
+
+impl ExportSecret for Box<dyn ExportSecret> {
+    fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        (**self).export_secret(label, context, len)
+    }
+
+    fn apply_commit(&mut self, commit: &[u8]) -> Result<(), mls_rs::error::MlsError> {
+        (**self).apply_commit(commit)
+    }
+
+    fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        (**self).create_commit()
+    }
+
+    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        (**self).group_info_for_external_commit(with_tree)
+    }
+
+    fn current_member_index(&self) -> u32 {
+        (**self).current_member_index()
+    }
 }
 impl<G: ExportSecret> CommitLog<G> {
    pub fn new(inner: G) -> Self {
@@ -95,6 +142,16 @@ impl<G: ExportSecret> CommitLog<G> {
 
     pub fn checkpoint(&self) -> u64 {
         self.checkpoint
+    }
+
+    pub fn current_epoch(&self) -> u64 {
+        self.current_epoch
+    }
+
+    pub fn reset_after_external_recovery(&mut self) {
+        self.current_epoch += 1;
+        self.checkpoint = self.current_epoch;
+        self.commit_log.clear();
     }
 }
 /// Error returned by [`apply_commit_window`].

@@ -186,7 +186,7 @@ async fn wait_for_ready(path: &Path, after: u64, poll: Duration) -> u64 {
     }
 }
 
-async fn bootstrap_bob(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
+async fn bootstrap_bob(dir: &Path) -> (Client<impl mls_rs::client_builder::MlsConfig>, Box<dyn quic_mls::ExportSecret>) {
     std::fs::create_dir_all(dir).unwrap();
     let kp_path = dir.join("bob_kp.bin");
     let welcome_path = dir.join("welcome.bin");
@@ -200,7 +200,7 @@ async fn bootstrap_bob(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
     let welcome_bytes = wait_for_file(&welcome_path, Duration::from_millis(50)).await;
     let welcome = MlsMessage::from_bytes(&welcome_bytes).unwrap();
     let (bob_group, _) = bob.join_group(None, &welcome, None).unwrap();
-    bob_group
+    (bob, Box::new(bob_group))
 }
 
 async fn bootstrap_alice(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
@@ -225,9 +225,72 @@ async fn bootstrap_alice(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
     alice_group
 }
 
+async fn recover_bob_via_external_commit(
+    bob_client: &Client<impl mls_rs::client_builder::MlsConfig + 'static>,
+    bob_group: &Arc<Mutex<Box<dyn quic_mls::ExportSecret>>>,
+    local_epoch: &Arc<Mutex<u64>>,
+    dir: &Path,
+    cycle: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let gi_bytes = wait_for_file(&dir.join("recovery_group_info.bin"), Duration::from_millis(50)).await;
+    let group_info = MlsMessage::from_bytes(&gi_bytes)?;
+    let epoch_bytes = wait_for_file(&dir.join("recovery_local_epoch.bin"), Duration::from_millis(50)).await;
+    let resulting_epoch: u64 = String::from_utf8(epoch_bytes)?.trim().parse()?;
+    let old_leaf_index = bob_group.lock().unwrap().current_member_index();
+    let (new_group, commit_out) = bob_client
+        .external_commit_builder()?
+        .with_removal(old_leaf_index)
+        .build(group_info)?;
+    *bob_group.lock().unwrap() = Box::new(new_group);
+    *local_epoch.lock().unwrap() = resulting_epoch;
+    std::fs::write(dir.join("recovery_commit.bin"), commit_out.to_bytes()?)?;
+    std::fs::write(dir.join("recovery_commit_ready.bin"), format!("{cycle}"))?;
+    Ok(())
+}
+
+async fn recover_alice_via_external_commit<G: ExportSecret>(
+    alice_group: &Arc<Mutex<CommitLog<G>>>,
+    dir: &Path,
+    cycle: u64,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (gi_bytes, resulting_epoch) = {
+        let guard = alice_group.lock().unwrap();
+        (guard.group_info_for_external_commit(true)?, guard.current_epoch() + 1)
+    };
+    std::fs::write(dir.join("recovery_local_epoch.bin"), format!("{resulting_epoch}"))?;
+    std::fs::write(dir.join("recovery_group_info.bin"), gi_bytes)?;
+    std::fs::write(dir.join("recovery_cycle.bin"), format!("{cycle}"))?;
+    let commit_bytes = tokio::time::timeout(timeout, async {
+        wait_for_ready(&dir.join("recovery_commit_ready.bin"), cycle - 1, Duration::from_millis(50)).await;
+        wait_for_file(&dir.join("recovery_commit.bin"), Duration::from_millis(50)).await
+    })
+    .await?;
+    alice_group.lock().unwrap().apply_commit(&commit_bytes)?;
+    alice_group.lock().unwrap().reset_after_external_recovery();
+    Ok(())
+}
+
 async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let bob_group = bootstrap_bob(&args.bootstrap_dir).await;
+    let (bob_client, bob_group) = bootstrap_bob(&args.bootstrap_dir).await;
     let bob_group = Arc::new(Mutex::new(bob_group));
+    let local_epoch = Arc::new(Mutex::new(0u64));
+
+    tokio::spawn({
+        let bob_group = Arc::clone(&bob_group);
+        let local_epoch = Arc::clone(&local_epoch);
+        let dir = args.bootstrap_dir.clone();
+        async move {
+            let mut last_cycle = 0u64;
+            loop {
+                let cycle = wait_for_ready(&dir.join("recovery_cycle.bin"), last_cycle, Duration::from_millis(50)).await;
+                if let Err(e) = recover_bob_via_external_commit(&bob_client, &bob_group, &local_epoch, &dir, cycle).await {
+                    tracing::error!("external-commit recovery failed: {e}");
+                }
+                last_cycle = cycle;
+            }
+        }
+    });
 
     let mode = "0rtt";
     let mut out = Telemetry::open(&args.out_path, mode).await?;
@@ -235,7 +298,6 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     let scenario_start = Instant::now();
     let mut cycle: u64 = 0;
-    let local_epoch = Arc::new(Mutex::new(0u64));
     let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
 
     // MlsServerConfig is single-use (start_session takes ownership of the group
@@ -269,8 +331,14 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 .into_0rtt()
                 .unwrap_or_else(|_| panic!("0-RTT keys not available"));
 
-        
-        let (send, recv) = conn.accept_bi().await?;
+        let (send, recv) = match tokio::time::timeout(args.report_timeout, conn.accept_bi()).await {
+            Ok(Ok(v)) => v,
+            _ => {
+                tracing::warn!("cycle {cycle}: stale connection (accept_bi timed out), abandoning and retrying");
+                conn.close(0u32.into(), b"stale");
+                continue;
+            }
+        };
         let is_0rtt = recv.is_0rtt();
 
         out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
@@ -314,6 +382,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut epoch: u64 = 0;
     let mut cycle: u64 = 0;
     let mut last_ready_seen: u64 = 0;
+    let mut recovery_cycle: u64 = 0;
 
     let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
 
@@ -332,24 +401,49 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
         cycle += 1;
         let t0 = Instant::now();
-        let connecting = endpoint.connect_with(make_client_config(idle), peer_addr, "localhost")?;
 
-        let (conn, zero_rtt_accepted) = connecting
-            .into_0rtt()
-            .unwrap_or_else(|_| panic!("0-RTT keys not available"));
+        let (conn, mut send, mut recv) = if cycle == 1 {
+            let connecting = endpoint.connect_with(make_client_config(idle), peer_addr, "localhost")?;
+            let (conn, zero_rtt_accepted) = connecting
+                .into_0rtt()
+                .unwrap_or_else(|_| panic!("0-RTT keys not available"));
 
-        
-        let (mut send, mut recv) = conn.open_bi().await?;
-        write_message(&mut send, &ControlMessage::Hello).await?;
-        out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+            let (mut send, recv) = conn.open_bi().await?;
+            write_message(&mut send, &ControlMessage::Hello).await?;
+            out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
 
-        let ok = zero_rtt_accepted.await;
-        let event = if ok {
-            if cycle == 1 { "handshake_0rtt_accepted" } else { "reconnect_handshake_0rtt_accepted" }
+            let ok = zero_rtt_accepted.await;
+            let event = if ok { "handshake_0rtt_accepted" } else { "handshake_0rtt_rejected" };
+            out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+            (conn, send, recv)
         } else {
-            if cycle == 1 { "handshake_0rtt_rejected" } else { "reconnect_handshake_0rtt_rejected" }
+            let connect_result = tokio::time::timeout(args.report_timeout, async {
+                let connecting = endpoint.connect_with(make_client_config(idle), peer_addr, "localhost")?;
+                let (conn, zero_rtt_accepted) = connecting
+                    .into_0rtt()
+                    .unwrap_or_else(|_| panic!("0-RTT keys not available"));
+
+                let (mut send, recv) = conn.open_bi().await?;
+                write_message(&mut send, &ControlMessage::Hello).await?;
+                let ok = zero_rtt_accepted.await;
+                Ok::<_, Box<dyn std::error::Error>>((conn, send, recv, ok))
+            })
+            .await;
+
+            let (conn, send, recv, ok) = match connect_result {
+                Ok(Ok(v)) => v,
+                _ => {
+                    recovery_cycle += 1;
+                    recover_alice_via_external_commit(&alice_group, &args.bootstrap_dir, recovery_cycle, args.report_timeout).await?;
+                    continue;
+                }
+            };
+
+            out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+            let event = if ok { "reconnect_handshake_0rtt_accepted" } else { "reconnect_handshake_0rtt_rejected" };
+            out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+            (conn, send, recv)
         };
-        out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
 
         if cycle > 1 {
             let t_flush = Instant::now();
