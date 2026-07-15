@@ -434,7 +434,9 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(Ok(v)) => v,
                 _ => {
                     recovery_cycle += 1;
+                    let t_recover = Instant::now();
                     recover_alice_via_external_commit(&alice_group, &args.bootstrap_dir, recovery_cycle, args.report_timeout).await?;
+                    out.row("external_commit_recovery", epoch, 0, t_recover.elapsed().as_secs_f64() * 1000.0).await?;
                     continue;
                 }
             };
