@@ -96,10 +96,7 @@ fn same_secret_reproduces_identical_key_different_secret_does_not() {
     // Different secrets must give different keys (direction independence).
     assert_ne!(client_packet, server_packet);
 
-    // The SAME secret, derived twice, must give the IDENTICAL key — this is
-    // exactly why client.local (built from client_secret) and server.remote
-    // (also built from client_secret) end up byte-for-byte equal in
-    // derive_directional_keys, even though we never compare them directly there.
+    
     let (client_packet_again, _) = derive_keys_from_secret(&client_secret);
     assert_eq!(client_packet, client_packet_again);
 }
@@ -111,9 +108,6 @@ fn derive_initial_keys_server_remote_decrypts_known_client_packet() {
     let dst_cid = [0x06u8, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b];
     let server_keys = derive_initial_keys(&dst_cid, Side::Server);
 
-    // Known-good vector (quinn-proto's own test suite, src/packet.rs::header_encoding):
-    // a real Initial packet, encrypted by the CLIENT, that this exact
-    // dst_cid must decrypt correctly via the SERVER's `.remote` key.
     let header: [u8; 19] = [
         0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b, 0x00, 0x00, 0x40, 0x21, 0x00,
     ];
@@ -132,8 +126,7 @@ fn derive_initial_keys_server_remote_decrypts_known_client_packet() {
 fn full_initial_packet_round_trip_with_20_byte_cid() {
     use bytes::BytesMut;
 
-    // Quinn's default RandomConnectionIdGenerator uses MAX_CID_SIZE (20 bytes),
-    // not the 8-byte CID from the reference vector — reproduce that shape.
+
     let dst_cid: [u8; 20] = [
         0x4d, 0xd1, 0x0b, 0x5d, 0x5c, 0x3b, 0x99, 0x7f, 0x91, 0xd5,
         0x69, 0x9d, 0xb2, 0x68, 0x92, 0x0e, 0xd9, 0xa4, 0x7c, 0x72,
@@ -141,10 +134,7 @@ fn full_initial_packet_round_trip_with_20_byte_cid() {
     let client_keys = derive_initial_keys(&dst_cid, Side::Client);
     let server_keys = derive_initial_keys(&dst_cid, Side::Server);
 
-    // Build a realistic Initial-packet-shaped buffer: 1(first byte) +
-    // 4(version) + 1(dcid_len) + 20(dcid) + 1(scid_len) + 1(token_len) +
-    // 2(length varint) = 30 bytes of header, then a packet number byte,
-    // then plaintext, then tag space.
+   
     let mut header = vec![0xc0u8, 0x00, 0x00, 0x00, 0x01, 20];
     header.extend_from_slice(&dst_cid);
     header.extend_from_slice(&[0x00, 0x00, 0x40, 0x21]); // scid_len, token_len, length varint

@@ -44,12 +44,7 @@ impl<C: mls_rs::client_builder::MlsConfig> ExportSecret for mls_rs::Group<C> {
         mls_rs::Group::current_member_index(self)
     }
 }
-//MlsClientConfig::new(Box::new(alice_group)) takes ownership of alice_group gets moved into the config, then into the live connection.  
-//Once that happens, test code has no way to reach it again but we need to do for rekey so this 
-//nstead of giving the config the Group directly, wrap it in Arc<Mutex<Group<...>>> first. 
-//Arc lets to hold multiple owners of the same data; Mutex lets to mutate it safely from multiple places. 
-//the config a clone of the Arc so the live MlsSession can call export_secret
-// this is outer layer of export_secret that locks the mutex and calls the inner Group's export_secret.
+
 impl<G: ExportSecret> ExportSecret for Arc<Mutex<G>> {
     fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError> {
         self.lock().unwrap().export_secret(label, context, len)
@@ -176,10 +171,7 @@ impl std::fmt::Display for CommitWindowError {
 
 impl std::error::Error for CommitWindowError {}
 
-/// Processes a received commit window on the receiver side.
-///
-/// Stale entries (epoch ≤ current) are silently skipped.  A gap or a
-/// malformed commit returns an error; the caller must trigger a full resync.
+
 pub fn apply_commit_window(
     group: &mut dyn ExportSecret,
     window: &[(u64, Vec<u8>)],

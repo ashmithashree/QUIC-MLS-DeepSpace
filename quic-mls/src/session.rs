@@ -7,10 +7,10 @@ use std::any::Any;
 use crate::retry::{verify_retry_tag};
 
 enum HsState {
-    Initial,               // call 1: write local_params at Initial level; return no keys
-    AwaitingZeroRttKeys,    // gate: wait for peer_params, then hand quinn-proto its first upgrade (Initial -> Handshake)
-    ConfirmingZeroRttKeys,  // next call: write the marker byte, hand quinn-proto its second upgrade (Handshake -> Data)
-    Done,                   // final state: nothing left to do
+    Initial,               
+    AwaitingZeroRttKeys,    
+    ConfirmingZeroRttKeys,  
+    Done,                   
 }
 
 // RFC 9000 s18.2 transport parameter IDs for the handful of integer
@@ -20,11 +20,8 @@ const TP_INITIAL_MAX_DATA: u64 = 0x04;
 const TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE: u64 = 0x06;
 const TP_INITIAL_MAX_STREAMS_BIDI: u64 = 0x08;
 
-// Codec::encode is the method that turns a number into its QUIC byte representation
-// the function has to actually do the encoding first, then count the result, instead of guessing the length up front
+
 fn encode_transport_param(buf: &mut Vec<u8>, id: u64, value: u64) {
-    //scratch buffer seperate from buf to hold the encoded value, 
-    // so we can measure its length before writing the length prefix to buf.
     let mut encoded_value = Vec::new();
     VarInt::from_u64(value).expect("test-scale value fits in a VarInt").encode(&mut encoded_value);
     VarInt::from_u64(id).expect("id fits in a VarInt").encode(buf);
@@ -112,12 +109,7 @@ impl Session for MlsSession {
                 self.state = HsState::AwaitingZeroRttKeys;
                 None
             }
-            // Gate on the peer's params, then signal quinn-proto's first
-            // upgrade (Initial -> Handshake) with an empty buf. quinn-proto
-            // treats an empty-buf Some(Keys) as "keys changed but nothing to
-            // send yet" and immediately re-invokes write_handshake in the
-            // same tick, which is what lets ConfirmingZeroRttKeys run right
-            // after this within a single write_crypto() pass.
+           
             HsState::AwaitingZeroRttKeys => {
                 if self.peer_params.is_none() {
                     return None;
@@ -125,11 +117,7 @@ impl Session for MlsSession {
                 self.state = HsState::ConfirmingZeroRttKeys;
                 self.pinned_zero_rtt_upgrade_keys.take()
             }
-            // Pushes one dummy byte to buf so quinn-proto has real CRYPTO
-            // frame content to send at the (now former) Handshake level,
-            // then signals its second upgrade (Handshake -> Data) by
-            // returning the pinned 0-RTT keys. The caller uses these to
-            // encrypt/decrypt 1-RTT-level packets.
+           
             HsState::ConfirmingZeroRttKeys => {
                 buf.push(0);
                 self.state = HsState::Done;
@@ -145,16 +133,15 @@ impl Session for MlsSession {
             let mut reader = buf;
             self.peer_params = Some(TransportParameters::read(self.side, &mut reader)?);
         }
-        Ok(false) // handshake_data() never gets populated  we have no TLS-style negotiated data
+        Ok(false) 
     }
 
     fn transport_parameters(&self) -> Result<Option<TransportParameters>, TransportError> {
-        // Real params (once read_handshake actually sees them) always win
-        // over the synthetic 0-RTT bootstrap value.
+        
         Ok(self.peer_params.or(self.cached_peer_params))
     }
 
-    // MLS-derived Keys for the 1-RTT space, after the handshake is complete.
+   
     fn next_1rtt_keys(&mut self) -> Option<KeyPair<Box<dyn PacketKey>>> {
         self.key_update_generation += 1;
     let keys = derive_mls_keys(
@@ -248,9 +235,7 @@ mod handshake_key_tests {
         let mut alice_session = MlsSession::new(Box::new(alice_group), Side::Client, alice_params);
         let mut bob_session = MlsSession::new(Box::new(bob_group), Side::Server, bob_params);
 
-        // ── Call 1 (Initial): write params at Initial level, no keys yet ──────
-        // (default-valued TransportParameters are omitted on the wire, so an
-        // empty buf here is expected only non-default fields get written.)
+        
         let mut alice_buf = Vec::new();
         assert!(alice_session.write_handshake(&mut alice_buf).is_none());
 
@@ -269,14 +254,14 @@ mod handshake_key_tests {
         assert!(alice_session.is_handshaking());
         assert!(bob_session.is_handshaking());
 
-        // ── Call 3 (ConfirmingZeroRttKeys): marker byte, keys ready -> Done ────
+      
         let alice_0rtt_keys = alice_session.write_handshake(&mut Vec::new()).expect("0-RTT keys on call 3");
         let bob_0rtt_keys = bob_session.write_handshake(&mut Vec::new()).expect("0-RTT keys on call 3");
 
         assert!(!alice_session.is_handshaking());
         assert!(!bob_session.is_handshaking());
 
-        // 0-RTT keys must work cross-party.
+       
         let header_len = 5;
         let plaintext = b"zero rtt level data";
         let mut buf = vec![0u8; header_len + plaintext.len() + 16];
@@ -287,7 +272,7 @@ mod handshake_key_tests {
         bob_0rtt_keys.packet.remote.decrypt(0, &buf[..header_len], &mut payload).unwrap();
         assert_eq!(&payload[..], plaintext);
 
-        // The handshake is fully done — a further call must do nothing.
+       
         assert!(alice_session.write_handshake(&mut Vec::new()).is_none());
     }
 
