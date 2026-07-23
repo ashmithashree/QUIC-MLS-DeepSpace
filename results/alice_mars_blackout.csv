@@ -1,0 +1,15 @@
+timestamp_ms,event,epoch,bytes,latency_ms,mode
+1784208865888,zero_rtt_available,0,0,2.866,0rtt
+1784209345935,handshake_0rtt_accepted,0,0,480049.597,0rtt
+1784210245941,commit_cpu,1,0,0.720,0rtt
+1784210245946,commit_net,1,518,900004.432,0rtt
+1784210245947,blackout_start,1,0,0.000,0rtt
+1784210245951,commit_offline,2,0,0.000,0rtt
+1784210305949,commit_offline,3,0,0.000,0rtt
+1784210365950,commit_offline,4,0,0.000,0rtt
+1784210425949,commit_offline,5,0,0.000,0rtt
+1784210485949,commit_offline,6,0,0.000,0rtt
+1784210545949,commit_offline,7,0,0.000,0rtt
+1784210605949,commit_offline,8,0,0.000,0rtt
+1784210665819,blackout_end,8,0,0.000,0rtt
+1784210665822,done,8,0,0.000,0rtt
