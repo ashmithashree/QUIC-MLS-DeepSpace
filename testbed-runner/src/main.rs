@@ -19,6 +19,13 @@ use tokio::io::AsyncWriteExt;
 
 const CS: CipherSuite = CipherSuite::CURVE25519_AES128;
 
+// Conservative default for `--transcript-max-bytes` (the paper's tunable
+// `tl`): sized so the encoded transcript, alongside the real transport
+// parameters, reliably fits in a single ~1200-byte Initial packet. Going
+// above this risks the client's Initial flight needing more than one
+// packet, which is unsupported here -- see the write-up's MTU discussion.
+const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = 900;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     Alice,
@@ -36,6 +43,7 @@ struct Args {
     blackout_on: Duration,
     blackout_off: Duration,
     report_timeout: Duration,
+    transcript_max_bytes: usize,
 }
 
 fn parse_args() -> Args {
@@ -49,6 +57,7 @@ fn parse_args() -> Args {
     let mut blackout_on = Duration::from_secs(0);
     let mut blackout_off = Duration::from_secs(0);
     let mut report_timeout = Duration::from_secs(10);
+    let mut transcript_max_bytes = DEFAULT_TRANSCRIPT_MAX_BYTES;
 
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -95,6 +104,10 @@ fn parse_args() -> Args {
                 let v = args.next().expect("--report-timeout-secs requires a value");
                 report_timeout = Duration::from_secs(v.parse().expect("bad --report-timeout-secs"));
             }
+            "--transcript-max-bytes" => {
+                let v = args.next().expect("--transcript-max-bytes requires a value");
+                transcript_max_bytes = v.parse().expect("bad --transcript-max-bytes");
+            }
             other => panic!("unknown flag: {other}"),
         }
     }
@@ -110,6 +123,7 @@ fn parse_args() -> Args {
         blackout_on,
         blackout_off,
         report_timeout,
+        transcript_max_bytes,
     }
 }
 
@@ -186,7 +200,7 @@ async fn wait_for_ready(path: &Path, after: u64, poll: Duration) -> u64 {
     }
 }
 
-async fn bootstrap_bob(dir: &Path) -> (Client<impl mls_rs::client_builder::MlsConfig>, Box<dyn quic_mls::ExportSecret>) {
+async fn bootstrap_bob(dir: &Path) -> Box<dyn quic_mls::ExportSecret> {
     std::fs::create_dir_all(dir).unwrap();
     let kp_path = dir.join("bob_kp.bin");
     let welcome_path = dir.join("welcome.bin");
@@ -200,7 +214,7 @@ async fn bootstrap_bob(dir: &Path) -> (Client<impl mls_rs::client_builder::MlsCo
     let welcome_bytes = wait_for_file(&welcome_path, Duration::from_millis(50)).await;
     let welcome = MlsMessage::from_bytes(&welcome_bytes).unwrap();
     let (bob_group, _) = bob.join_group(None, &welcome, None).unwrap();
-    (bob, Box::new(bob_group))
+    Box::new(bob_group)
 }
 
 async fn bootstrap_alice(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
@@ -225,72 +239,15 @@ async fn bootstrap_alice(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
     alice_group
 }
 
-async fn recover_bob_via_external_commit(
-    bob_client: &Client<impl mls_rs::client_builder::MlsConfig + 'static>,
-    bob_group: &Arc<Mutex<Box<dyn quic_mls::ExportSecret>>>,
-    local_epoch: &Arc<Mutex<u64>>,
-    dir: &Path,
-    cycle: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let gi_bytes = wait_for_file(&dir.join("recovery_group_info.bin"), Duration::from_millis(50)).await;
-    let group_info = MlsMessage::from_bytes(&gi_bytes)?;
-    let epoch_bytes = wait_for_file(&dir.join("recovery_local_epoch.bin"), Duration::from_millis(50)).await;
-    let resulting_epoch: u64 = String::from_utf8(epoch_bytes)?.trim().parse()?;
-    let old_leaf_index = bob_group.lock().unwrap().current_member_index();
-    let (new_group, commit_out) = bob_client
-        .external_commit_builder()?
-        .with_removal(old_leaf_index)
-        .build(group_info)?;
-    *bob_group.lock().unwrap() = Box::new(new_group);
-    *local_epoch.lock().unwrap() = resulting_epoch;
-    std::fs::write(dir.join("recovery_commit.bin"), commit_out.to_bytes()?)?;
-    std::fs::write(dir.join("recovery_commit_ready.bin"), format!("{cycle}"))?;
-    Ok(())
-}
-
-async fn recover_alice_via_external_commit<G: ExportSecret>(
-    alice_group: &Arc<Mutex<CommitLog<G>>>,
-    dir: &Path,
-    cycle: u64,
-    timeout: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let (gi_bytes, resulting_epoch) = {
-        let guard = alice_group.lock().unwrap();
-        (guard.group_info_for_external_commit(true)?, guard.current_epoch() + 1)
-    };
-    std::fs::write(dir.join("recovery_local_epoch.bin"), format!("{resulting_epoch}"))?;
-    std::fs::write(dir.join("recovery_group_info.bin"), gi_bytes)?;
-    std::fs::write(dir.join("recovery_cycle.bin"), format!("{cycle}"))?;
-    let commit_bytes = tokio::time::timeout(timeout, async {
-        wait_for_ready(&dir.join("recovery_commit_ready.bin"), cycle - 1, Duration::from_millis(50)).await;
-        wait_for_file(&dir.join("recovery_commit.bin"), Duration::from_millis(50)).await
-    })
-    .await?;
-    alice_group.lock().unwrap().apply_commit(&commit_bytes)?;
-    alice_group.lock().unwrap().reset_after_external_recovery();
-    Ok(())
-}
-
 async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let (bob_client, bob_group) = bootstrap_bob(&args.bootstrap_dir).await;
+    let bob_group = bootstrap_bob(&args.bootstrap_dir).await;
     let bob_group = Arc::new(Mutex::new(bob_group));
+    // Shared between MlsServerConfig (handshake-time catch-up, applied
+    // inside MlsSession::read_handshake before keys are derived) and
+    // run_commit_receiver (steady-state catch-up, post-handshake) below --
+    // the same counter, so the two mechanisms agree on how far behind Bob
+    // is instead of racing or double-applying.
     let local_epoch = Arc::new(Mutex::new(0u64));
-
-    tokio::spawn({
-        let bob_group = Arc::clone(&bob_group);
-        let local_epoch = Arc::clone(&local_epoch);
-        let dir = args.bootstrap_dir.clone();
-        async move {
-            let mut last_cycle = 0u64;
-            loop {
-                let cycle = wait_for_ready(&dir.join("recovery_cycle.bin"), last_cycle, Duration::from_millis(50)).await;
-                if let Err(e) = recover_bob_via_external_commit(&bob_client, &bob_group, &local_epoch, &dir, cycle).await {
-                    tracing::error!("external-commit recovery failed: {e}");
-                }
-                last_cycle = cycle;
-            }
-        }
-    });
 
     let mode = "0rtt";
     let mut out = Telemetry::open(&args.out_path, mode).await?;
@@ -304,9 +261,12 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // once), so a fresh one is required for every connection -- but the Endpoint
     // itself (and its bound UDP socket) is reused across reconnects.
     let make_server_config = |idle: Duration| {
-        let mut cfg = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(Arc::clone(
-                &bob_group)))));
-            
+        let mut cfg = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
+            Box::new(Arc::clone(&bob_group)),
+            Arc::clone(&local_epoch),
+            args.transcript_max_bytes,
+        )));
+
         cfg.transport_config(transport_config(idle));
         cfg
     };
@@ -345,7 +305,11 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         out.row(if is_0rtt { "control_stream_0rtt" } else { "control_stream_1rtt" }, 0, 0, 0.0).await?;
         zero_rtt_accepted.await;
         let event = if cycle == 1 { "handshake_confirmed" } else { "reconnect_handshake_confirmed" };
-        out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
+        // By this point MlsSession::read_handshake has already applied any
+        // transcript embedded in the peer's Initial flight, so local_epoch
+        // reflects handshake-time catch-up, not just steady-state trickle.
+        let epoch_now = *local_epoch.lock().unwrap();
+        out.row(event, epoch_now, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
 
         let should_report = Arc::new(AtomicBool::new(true));
         let recv_task = tokio::spawn(run_commit_receiver(
@@ -382,14 +346,14 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut epoch: u64 = 0;
     let mut cycle: u64 = 0;
     let mut last_ready_seen: u64 = 0;
-    let mut recovery_cycle: u64 = 0;
 
     let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
 
-    
     let make_client_config = | idle: Duration| {
-        let mut cfg = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(
-                &alice_group,)))));
+        let mut cfg = ClientConfig::new(Arc::new(MlsClientConfig::new(
+            Box::new(Arc::clone(&alice_group)),
+            args.transcript_max_bytes,
+        )));
         cfg.transport_config(transport_config(idle));
         cfg
     };
@@ -417,6 +381,15 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
             (conn, send, recv)
         } else {
+            // Fig. 2 line 22 / this project's Enc: the commit transcript
+            // rides alongside the ciphertext tuple as part of the Initial-
+            // level handshake data (see MlsSession::write_handshake), not
+            // over this control stream. Log what's about to be embedded
+            // before attempting the reconnect.
+            let window = alice_group.lock().unwrap().window_bytes();
+            let embedded_bytes = quic_mls::encode_transcript(&window, args.transcript_max_bytes).len();
+            out.row("handshake_transcript_embedded", epoch, embedded_bytes as u64, 0.0).await?;
+
             let connect_result = tokio::time::timeout(args.report_timeout, async {
                 let connecting = endpoint.connect_with(make_client_config(idle), peer_addr, "localhost")?;
                 let (conn, zero_rtt_accepted) = connecting
@@ -430,13 +403,14 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             })
             .await;
 
+            // Alice never blocks waiting on Bob to catch up (invariant 1):
+            // a failed cycle just moves on to the next contact window. Her
+            // commit log is untouched (checkpoint/trim only ever advance
+            // via a successful Report round trip in send_window_and_trim),
+            // so the next attempt offers an equal-or-larger window.
             let (conn, send, recv, ok) = match connect_result {
                 Ok(Ok(v)) => v,
-                _ => {
-                    recovery_cycle += 1;
-                    recover_alice_via_external_commit(&alice_group, &args.bootstrap_dir, recovery_cycle, args.report_timeout).await?;
-                    continue;
-                }
+                _ => continue,
             };
 
             out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;

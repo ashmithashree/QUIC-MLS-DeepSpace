@@ -1411,6 +1411,7 @@ dependencies = [
  "quinn-proto",
  "sha2",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
