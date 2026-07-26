@@ -12,8 +12,15 @@ pub trait ExportSecret: Send + Sync {
     fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError>;
     fn apply_commit(&mut self, commit: &[u8]) -> Result<(), mls_rs::error::MlsError>;
     fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError>;
-    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError>;
-    fn current_member_index(&self) -> u32;
+
+    // The commit-transcript window a sender would embed in its next
+    // handshake (Fig. 2's `ast'`). Default empty: a plain `Group` (e.g. Bob,
+    // who never originates commits in this testbed) has nothing to offer.
+    // Only `CommitLog` overrides this with its real, checkpoint-bounded
+    // window.
+    fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
+        Vec::new()
+    }
 }
 // this calls the mls_rs::Group methods to export secrets, process_incoming_message and apply commits.
 impl<C: mls_rs::client_builder::MlsConfig> ExportSecret for mls_rs::Group<C> {
@@ -35,14 +42,6 @@ impl<C: mls_rs::client_builder::MlsConfig> ExportSecret for mls_rs::Group<C> {
         self.apply_pending_commit()?;
         commit_output.commit_message.to_bytes()
     }
-
-    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError> {
-        Ok(self.group_info_message_allowing_ext_commit(with_tree)?.to_bytes()?)
-    }
-
-    fn current_member_index(&self) -> u32 {
-        mls_rs::Group::current_member_index(self)
-    }
 }
 
 impl<G: ExportSecret> ExportSecret for Arc<Mutex<G>> {
@@ -58,12 +57,8 @@ impl<G: ExportSecret> ExportSecret for Arc<Mutex<G>> {
         self.lock().unwrap().create_commit()
     }
 
-    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError> {
-        self.lock().unwrap().group_info_for_external_commit(with_tree)
-    }
-
-    fn current_member_index(&self) -> u32 {
-        self.lock().unwrap().current_member_index()
+    fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
+        self.lock().unwrap().pending_commit_window()
     }
 }
 
@@ -82,12 +77,8 @@ impl<G: ExportSecret> ExportSecret for CommitLog<G> {
         Ok(bytes)
     }
 
-    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError> {
-        self.inner.group_info_for_external_commit(with_tree)
-    }
-
-    fn current_member_index(&self) -> u32 {
-        self.inner.current_member_index()
+    fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
+        self.window_bytes()
     }
 }
 
@@ -104,12 +95,8 @@ impl ExportSecret for Box<dyn ExportSecret> {
         (**self).create_commit()
     }
 
-    fn group_info_for_external_commit(&self, with_tree: bool) -> Result<Vec<u8>, mls_rs::error::MlsError> {
-        (**self).group_info_for_external_commit(with_tree)
-    }
-
-    fn current_member_index(&self) -> u32 {
-        (**self).current_member_index()
+    fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
+        (**self).pending_commit_window()
     }
 }
 impl<G: ExportSecret> CommitLog<G> {
@@ -141,12 +128,6 @@ impl<G: ExportSecret> CommitLog<G> {
 
     pub fn current_epoch(&self) -> u64 {
         self.current_epoch
-    }
-
-    pub fn reset_after_external_recovery(&mut self) {
-        self.current_epoch += 1;
-        self.checkpoint = self.current_epoch;
-        self.commit_log.clear();
     }
 }
 /// Error returned by [`apply_commit_window`].
