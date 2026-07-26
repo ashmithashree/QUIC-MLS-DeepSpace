@@ -517,7 +517,20 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             // so the next attempt offers an equal-or-larger window.
             let (conn, send, recv, ok) = match connect_result {
                 Ok(Ok(v)) => v,
-                _ => continue,
+                Err(_) => {
+                    tracing::warn!(cycle, elapsed_ms = t0.elapsed().as_millis() as u64,
+                        "reconnect attempt timed out after report_timeout, retrying next contact window");
+                    out.row("reconnect_attempt_timed_out", epoch, 0,
+                        t0.elapsed().as_secs_f64() * 1000.0).await?;
+                    continue;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(cycle, error = %e,
+                        "reconnect attempt failed (not a timeout), retrying next contact window");
+                    out.row("reconnect_attempt_failed", epoch, 0,
+                        t0.elapsed().as_secs_f64() * 1000.0).await?;
+                    continue;
+                }
             };
 
             out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
