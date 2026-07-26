@@ -1,15 +1,3 @@
-use bytes::Buf;
-use quinn_proto::coding::Codec;
-use quinn_proto::VarInt;
-
-// Custom transport-parameter id for the embedded commit transcript. RFC 9000
-// s7.4.1 reserves ids of the form `31 * N + 27` for GREASE and requires every
-// other unrecognized id to be skipped by readers (confirmed against
-// quinn-proto's TransportParameters::read, which does exactly that) -- so any
-// id outside that pattern is safe to piggyback here. Chosen to be
-// unmistakably non-standard rather than adjacent to the low, IANA-assigned ids.
-pub const TRANSCRIPT_TP_ID: u64 = 0x5051_4d54; // ascii-ish "PQMT", arbitrary
-
 const MAGIC: [u8; 4] = *b"QMT1";
 
 /// Why a transcript blob failed to decode. Never constructed from a panic --
@@ -104,47 +92,6 @@ pub fn decode_transcript(bytes: &[u8]) -> Result<Vec<(u64, Vec<u8>)>, Transcript
     Ok(out)
 }
 
-/// Appends the transcript as one transport-parameter-shaped TLV
-/// (varint id, varint len, payload) to `buf`. Writes nothing if the encoded
-/// transcript is empty (empty window, or `max_bytes == 0`), so a peer with
-/// no pending commits (e.g. Bob) produces byte-identical handshake data to
-/// before this feature existed.
-pub fn write_transcript_param(buf: &mut Vec<u8>, window: &[(u64, Vec<u8>)], max_bytes: usize) {
-    let payload = encode_transcript(window, max_bytes);
-    if payload.is_empty() {
-        return;
-    }
-    VarInt::from_u64(TRANSCRIPT_TP_ID)
-        .expect("id fits in a VarInt")
-        .encode(buf);
-    VarInt::from_u64(payload.len() as u64)
-        .expect("transcript payload fits in a VarInt")
-        .encode(buf);
-    buf.extend_from_slice(&payload);
-}
-
-/// Scans a raw transport-parameter TLV stream for our custom id and decodes
-/// it if present. Returns `None` if absent, malformed, or truncated -- never
-/// panics, and never mistakes an arbitrary byte sequence (e.g. a real QUIC
-/// packet) for a transcript, since that requires both a matching varint-
-/// framed id and our magic bytes to line up.
-pub fn read_transcript_param(buf: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
-    let mut reader: &[u8] = buf;
-    while reader.has_remaining() {
-        let id = VarInt::decode(&mut reader).ok()?.into_inner();
-        let len = VarInt::decode(&mut reader).ok()?.into_inner() as usize;
-        if reader.remaining() < len {
-            return None;
-        }
-        if id == TRANSCRIPT_TP_ID {
-            let payload = &reader[..len];
-            return decode_transcript(payload).ok();
-        }
-        reader.advance(len);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,31 +113,8 @@ mod tests {
     }
 
     #[test]
-    fn tlv_round_trip_through_a_larger_buffer() {
-        let window = sample_window();
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"unrelated-leading-bytes");
-        write_transcript_param(&mut buf, &window, usize::MAX);
-        buf.extend_from_slice(b"unrelated-trailing-bytes-that-are-not-a-tlv-at-all");
-
-        // A scan starting mid-buffer (right at our TLV) must find it...
-        let from_our_tlv = &buf[b"unrelated-leading-bytes".len()..];
-        assert_eq!(read_transcript_param(from_our_tlv), Some(window));
-    }
-
-    #[test]
-    fn empty_window_writes_nothing() {
-        let mut buf = Vec::new();
-        write_transcript_param(&mut buf, &[], usize::MAX);
-        assert!(buf.is_empty());
-    }
-
-    #[test]
     fn zero_cap_disables_embedding() {
         let window = sample_window();
-        let mut buf = Vec::new();
-        write_transcript_param(&mut buf, &window, 0);
-        assert!(buf.is_empty());
         assert_eq!(encode_transcript(&window, 0), Vec::<u8>::new());
     }
 
@@ -246,20 +170,14 @@ mod tests {
     }
 
     #[test]
-    fn read_transcript_param_never_panics_on_arbitrary_bytes() {
-        for len in 0..64 {
-            let garbage: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
-            let _ = read_transcript_param(&garbage);
-        }
-    }
-
-    #[test]
     fn a_real_quic_initial_packet_is_never_mistaken_for_a_transcript() {
         // A real Initial packet header + ciphertext from quinn-proto's own
         // RFC 9001 test vector (see keys.rs's
         // derive_initial_keys_server_remote_decrypts_known_client_packet) --
-        // structurally nothing like our TLV framing, and critically doesn't
-        // happen to carry our magic bytes anywhere reachable by the scanner.
+        // structurally nothing like our blob framing, and critically
+        // doesn't happen to carry our magic bytes anywhere reachable by the
+        // decoder. Reused (see preamble.rs) for the datagram-level negative
+        // test alongside a constructed short-header fixture.
         let header: [u8; 19] = [
             0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b,
             0x00, 0x00, 0x40, 0x21, 0x00,
@@ -273,7 +191,6 @@ mod tests {
         packet_bytes.extend_from_slice(&header);
         packet_bytes.extend_from_slice(&ciphertext_and_tag);
 
-        assert_eq!(read_transcript_param(&packet_bytes), None);
         assert!(decode_transcript(&packet_bytes).is_err());
     }
 }

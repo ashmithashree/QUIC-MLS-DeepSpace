@@ -54,9 +54,9 @@ where
     B: ExportSecret + 'static,
 {
     let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
-        Box::new(Arc::clone(bob_group)), Arc::new(Mutex::new(0u64)), usize::MAX,
+        Box::new(Arc::clone(bob_group)),
     )));
-    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(alice_group)), usize::MAX)));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(alice_group)))));
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
     (server, server_addr, client_config)
@@ -96,9 +96,9 @@ async fn quic_mls_loopback_echo() {
     let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
 
     let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
-        Box::new(bob_group), Arc::new(Mutex::new(0u64)), usize::MAX,
+        Box::new(bob_group),
     )));
-    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(alice_group), usize::MAX)));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(alice_group))));
 
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
@@ -251,9 +251,9 @@ async fn quic_mls_loopback_0rtt_echo() {
     let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
 
     let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
-        Box::new(bob_group), Arc::new(Mutex::new(0u64)), usize::MAX,
+        Box::new(bob_group),
     )));
-    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(alice_group), usize::MAX)));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(alice_group))));
 
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
@@ -342,9 +342,9 @@ async fn quic_mls_0rtt_create_commit_race_before_handshake_confirms() {
     let alice_group = Arc::new(Mutex::new(alice_group));
 
     let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
-        Box::new(bob_group), Arc::new(Mutex::new(0u64)), usize::MAX,
+        Box::new(bob_group),
     )));
-    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)), usize::MAX)));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)))));
 
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();

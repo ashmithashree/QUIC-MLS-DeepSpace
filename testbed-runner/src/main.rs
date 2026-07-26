@@ -13,18 +13,23 @@ use mls_rs::{
     CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList, MlsMessage,
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-use quic_mls::{run_commit_receiver, send_window_and_trim, CommitLog, ExportSecret, MlsClientConfig, MlsServerConfig, ControlMessage, write_message,};
-use quinn::{ClientConfig, Endpoint, IdleTimeout, ServerConfig, TransportConfig};
+use quic_mls::{
+    apply_commit_window, run_commit_receiver, send_window_and_trim, CommitLog, CommitSink,
+    ExportSecret, MlsClientConfig, MlsServerConfig, ControlMessage, PreambleSocket, write_message,
+};
+use quinn::{AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, IdleTimeout, ServerConfig, TransportConfig};
 use tokio::io::AsyncWriteExt;
 
 const CS: CipherSuite = CipherSuite::CURVE25519_AES128;
 
-// Conservative default for `--transcript-max-bytes` (the paper's tunable
-// `tl`): sized so the encoded transcript, alongside the real transport
-// parameters, reliably fits in a single ~1200-byte Initial packet. Going
-// above this risks the client's Initial flight needing more than one
-// packet, which is unsupported here -- see the write-up's MTU discussion.
-const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = 900;
+// The paper's tunable transcript length `tl`: a total-byte budget across all
+// preamble datagrams for one arm()/`send_preamble` call (still truncates to
+// the earliest contiguous prefix of the backlog if set low, for research
+// use). Unlike the old transport-parameter mechanism this replaced, there is
+// no single-packet ceiling to size a small default around -- datagrams are
+// chunked to fit the network MTU regardless of how large the backlog is --
+// so the default is effectively unbounded.
+const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = usize::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -131,6 +136,21 @@ fn transport_config(idle: Duration) -> Arc<TransportConfig> {
     let mut cfg = TransportConfig::default();
     cfg.max_idle_timeout(Some(IdleTimeout::try_from(idle).unwrap()));
     Arc::new(cfg)
+}
+
+// `EndpointConfig::default()` has `grease_quic_bit: true` (RFC 9287): quinn-proto
+// will then randomly clear the fixed bit (0x40) on outgoing packets to prevent
+// implementations from ossifying on it always being set. That's exactly the bit
+// PreambleSocket's marker check depends on to prove a datagram is real QUIC
+// traffic (RFC 9000 S17.2/17.3.1 -- absent greasing, quinn-proto never clears
+// both the header-form bit and the fixed bit together). Confirmed empirically:
+// with greasing left on, real 1-RTT short-header packets were intermittently
+// intercepted and dropped by the preamble layer instead of reaching quinn.
+// Must be disabled on both endpoints for the discriminator to hold.
+fn endpoint_config_without_quic_bit_greasing() -> EndpointConfig {
+    let mut cfg = EndpointConfig::default();
+    cfg.grease_quic_bit(false);
+    cfg
 }
 
 struct Telemetry {
@@ -242,8 +262,10 @@ async fn bootstrap_alice(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
 async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let bob_group = bootstrap_bob(&args.bootstrap_dir).await;
     let bob_group = Arc::new(Mutex::new(bob_group));
-    // Shared between MlsServerConfig (handshake-time catch-up, applied
-    // inside MlsSession::read_handshake before keys are derived) and
+    // Shared between the preamble socket's sink (handshake-adjacent catch-up,
+    // applied as soon as a preamble datagram decodes, independent of and not
+    // synchronized with MlsSession::read_handshake/write_handshake -- see the
+    // race-condition note in the plan this was built from) and
     // run_commit_receiver (steady-state catch-up, post-handshake) below --
     // the same counter, so the two mechanisms agree on how far behind Bob
     // is instead of racing or double-applying.
@@ -263,15 +285,54 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let make_server_config = |idle: Duration| {
         let mut cfg = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
             Box::new(Arc::clone(&bob_group)),
-            Arc::clone(&local_epoch),
-            args.transcript_max_bytes,
         )));
 
         cfg.transport_config(transport_config(idle));
         cfg
     };
 
-    let endpoint = Endpoint::server(make_server_config(idle), args.bind_addr)?;
+    // Decodes and applies a preamble datagram's commit window directly
+    // against `bob_group`, independent of the QUIC handshake in flight on
+    // the same socket. `apply_commit_window`'s existing `epoch <=
+    // local_epoch` skip is what makes this safe against replay: nothing at
+    // this layer binds a preamble to a connection ID or packet number, so a
+    // captured preamble could be replayed by anyone who can reach this port,
+    // at any time -- idempotency is the only thing preventing that from
+    // being reapplied or causing confusion (see PreambleSocket's docs).
+    let sink: CommitSink = {
+        let bob_group = Arc::clone(&bob_group);
+        let local_epoch = Arc::clone(&local_epoch);
+        Arc::new(move |window: &[(u64, Vec<u8>)]| {
+            let mut epoch = local_epoch.lock().unwrap();
+            let before = *epoch;
+            let mut group = bob_group.lock().unwrap();
+            match apply_commit_window(&mut *group, window, &mut epoch) {
+                Ok(()) if *epoch != before => {
+                    tracing::info!(
+                        from_epoch = before,
+                        to_epoch = *epoch,
+                        "quic-mls: applied preamble commit window"
+                    );
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        local_epoch = *epoch,
+                        "quic-mls: could not apply preamble commit window: {e}"
+                    );
+                }
+            }
+        })
+    };
+    let bob_socket = tokio::net::UdpSocket::bind(args.bind_addr).await?;
+    let preamble_socket: Arc<dyn AsyncUdpSocket> =
+        Arc::new(PreambleSocket::new(bob_socket, Some(sink)));
+    let endpoint = Endpoint::new_with_abstract_socket(
+        endpoint_config_without_quic_bit_greasing(),
+        Some(make_server_config(idle)),
+        preamble_socket,
+        quinn::default_runtime().expect("tokio runtime available"),
+    )?;
 
     while scenario_start.elapsed() < args.duration {
         cycle += 1;
@@ -352,13 +413,24 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let make_client_config = | idle: Duration| {
         let mut cfg = ClientConfig::new(Arc::new(MlsClientConfig::new(
             Box::new(Arc::clone(&alice_group)),
-            args.transcript_max_bytes,
         )));
         cfg.transport_config(transport_config(idle));
         cfg
     };
 
-    let endpoint = Endpoint::client(args.bind_addr)?;
+    // Alice never receives a preamble in this testbed (Bob never originates
+    // commits), so `sink = None` -- see PreambleSocket::new's docs. Kept as
+    // a concrete handle (not just the `Arc<dyn AsyncUdpSocket>` handed to
+    // quinn below) so `send_preamble` can be called on it directly from the
+    // reconnect loop.
+    let alice_socket = tokio::net::UdpSocket::bind(args.bind_addr).await?;
+    let preamble_socket = Arc::new(PreambleSocket::new(alice_socket, None));
+    let endpoint = Endpoint::new_with_abstract_socket(
+        endpoint_config_without_quic_bit_greasing(),
+        None,
+        Arc::clone(&preamble_socket) as Arc<dyn AsyncUdpSocket>,
+        quinn::default_runtime().expect("tokio runtime available"),
+    )?;
 
     while scenario_start.elapsed() < args.duration {
         last_ready_seen = wait_for_ready(&ready_path, last_ready_seen, Duration::from_millis(20)).await;
@@ -381,14 +453,27 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
             (conn, send, recv)
         } else {
-            // Fig. 2 line 22 / this project's Enc: the commit transcript
-            // rides alongside the ciphertext tuple as part of the Initial-
-            // level handshake data (see MlsSession::write_handshake), not
-            // over this control stream. Log what's about to be embedded
-            // before attempting the reconnect.
+            // The commit transcript travels as one or more plaintext UDP
+            // datagrams sent directly over the same socket quinn will use
+            // for the QUIC connection, immediately before attempting the
+            // reconnect -- not embedded in the handshake itself (see
+            // PreambleSocket::send_preamble). A single best-effort
+            // fire-and-forget send: never awaited under `report_timeout`,
+            // since a dropped preamble datagram is simply retried (with an
+            // equal-or-larger window) on the next contact window, per
+            // invariant 1.
             let window = alice_group.lock().unwrap().window_bytes();
-            let embedded_bytes = quic_mls::encode_transcript(&window, args.transcript_max_bytes).len();
-            out.row("handshake_transcript_embedded", epoch, embedded_bytes as u64, 0.0).await?;
+            let t_preamble = Instant::now();
+            let embedded_bytes = preamble_socket
+                .send_preamble(peer_addr, &window, args.transcript_max_bytes)
+                .await?;
+            out.row(
+                "handshake_transcript_embedded",
+                epoch,
+                embedded_bytes,
+                t_preamble.elapsed().as_secs_f64() * 1000.0,
+            )
+            .await?;
 
             let connect_result = tokio::time::timeout(args.report_timeout, async {
                 let connecting = endpoint.connect_with(make_client_config(idle), peer_addr, "localhost")?;
