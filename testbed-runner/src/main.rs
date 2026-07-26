@@ -299,13 +299,25 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // captured preamble could be replayed by anyone who can reach this port,
     // at any time -- idempotency is the only thing preventing that from
     // being reapplied or causing confusion (see PreambleSocket's docs).
+    //
+    // Lock order MUST match run_commit_receiver's (control.rs: group, then
+    // local_epoch) exactly. This sink runs synchronously inside
+    // PreambleSocket::poll_recv, which the endpoint driver calls for the
+    // whole lifetime of the socket -- concurrently, by construction, with
+    // run_commit_receiver's steady-state loop on the same two mutexes for
+    // the same connection. Acquiring them in the opposite order here would
+    // be a textbook AB-BA deadlock: run_commit_receiver holding `group` and
+    // waiting on `local_epoch` while this sink holds `local_epoch` and
+    // waits on `group` freezes not just commit application but the entire
+    // endpoint driver, since nothing else can proceed until poll_recv
+    // returns.
     let sink: CommitSink = {
         let bob_group = Arc::clone(&bob_group);
         let local_epoch = Arc::clone(&local_epoch);
         Arc::new(move |window: &[(u64, Vec<u8>)]| {
+            let mut group = bob_group.lock().unwrap();
             let mut epoch = local_epoch.lock().unwrap();
             let before = *epoch;
-            let mut group = bob_group.lock().unwrap();
             match apply_commit_window(&mut *group, window, &mut epoch) {
                 Ok(()) if *epoch != before => {
                     tracing::info!(
