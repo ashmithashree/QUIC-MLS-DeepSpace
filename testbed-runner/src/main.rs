@@ -208,13 +208,23 @@ async fn wait_for_file(path: &Path, poll: Duration) -> Vec<u8> {
 }
 
 async fn wait_for_ready(path: &Path, after: u64, poll: Duration) -> u64 {
+    tracing::info!(after, ?timeout, "waiting for peer ready-cycle file");
+    let start = Instant::now();
     loop {
         if let Ok(s) = std::fs::read_to_string(path) {
             if let Ok(c) = s.trim().parse::<u64>() {
                 if c > after {
+                    tracing::info!(cycle = c, elapsed_ms = start.elapsed().as_millis() as u64,
+                        "peer ready-cycle observed");
                     return c;
                 }
             }
+        }
+        if start.elapsed() >= timeout {
+            tracing::warn!(after, elapsed_ms = start.elapsed().as_millis() as u64,
+                "wait_for_ready timed out -- proceeding with stale cycle value, \
+                 peer's connection-close notification may still be in flight or lost");
+            return after;
         }
         tokio::time::sleep(poll).await;
     }
