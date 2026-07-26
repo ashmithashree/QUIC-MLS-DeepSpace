@@ -26,9 +26,7 @@ impl quinn_proto::crypto::ClientConfig for MlsClientConfig {
         _server_name: &str,
         params: &TransportParameters,
     ) -> Result<Box<dyn Session>, ConnectError> {
-        //it gets the group out of the mutex, and takes ownership of it. If the mutex is already empty,
-        //it means that start_session has already been called once, and it panics.
-        //the group is then used to create a new MlsSession, which is returned as a boxed trait object.
+        
         let group = self.group.lock().unwrap().take()
             .expect("MlsClientConfig is single-use: start_session called more than once");
         Ok(Box::new(MlsSession::new(group, Side::Client, *params)))

@@ -5,8 +5,7 @@ pub(crate) struct Aes128EcbHeaderKey {
 }
 
 impl HeaderKey for Aes128EcbHeaderKey {
-    // The receiver doesn't know pn_len until the first byte's mask has been
-    // removed, so pn_len must be read AFTER unmasking packet[0].
+   
     fn decrypt(&self, pn_offset: usize, packet: &mut [u8]) {
         let mask = self.compute_mask(&packet[pn_offset + 4..pn_offset + 20]);
         Self::xor_first_byte(packet, mask[0]);
@@ -14,9 +13,7 @@ impl HeaderKey for Aes128EcbHeaderKey {
         Self::xor_pn_bytes(packet, pn_offset, pn_len, &mask);
     }
 
-    // The sender already knows pn_len from how it encoded the packet number.
-    // Masking packet[0] can flip its low 2 bits, so pn_len must be read
-    // BEFORE masking — otherwise the wrong number of pn bytes get masked.
+   
     fn encrypt(&self, pn_offset: usize, packet: &mut [u8]) {
         let mask = self.compute_mask(&packet[pn_offset + 4..pn_offset + 20]);
         let pn_len = (packet[0] & 0x03) as usize + 1;
@@ -64,9 +61,7 @@ mod tests {
     use ::hkdf::Hkdf;
     use sha2::Sha256;
 
-    // Known-good vector reproduced from quinn-proto's own test suite
-    // (quinn-proto-0.11.14 src/packet.rs::header_encoding) — a verified
-    // reference implementation's actual output, not a hand-derived value.
+  
     #[test]
     fn compute_mask_matches_known_vector() {
         let dst_cid = [0x06u8, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b];
@@ -109,9 +104,7 @@ mod tests {
             .unwrap();
         let header_key = Aes128EcbHeaderKey { key: hp_key };
 
-        // The unprotected packet (header_data, including the plain pn byte,
-        // followed by the AEAD ciphertext+tag, which header protection never
-        // touches).
+       
         #[rustfmt::skip]
         let mut packet: Vec<u8> = vec![
             0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0xb8, 0x58, 0xec, 0x6f, 0x80, 0x45, 0x2b, 0x00, 0x00, 0x40, 0x21, 0x00,

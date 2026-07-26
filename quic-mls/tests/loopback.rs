@@ -277,9 +277,7 @@ async fn quic_mls_loopback_0rtt_echo() {
     let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
     endpoint.set_default_client_config(client_config);
 
-    // into_0rtt() hands back a Connection usable immediately, before the
-    // handshake round trip completes, plus a future that resolves once we
-    // know whether the server accepted the early data.
+
     let (conn, zero_rtt_accepted) = endpoint
         .connect(server_addr, "localhost")
         .unwrap()
@@ -295,9 +293,7 @@ async fn quic_mls_loopback_0rtt_echo() {
     println!("0-RTT echo: {}", String::from_utf8_lossy(&response));
     assert_eq!(response, b"Hello, 0-RTT QUIC-MLS!");
 
-    // Primary proof: the SERVER actually decrypted this stream's data
-    // during 0-RTT, not via a 1-RTT fallback retransmission after the
-    // handshake completed.
+  
     let server_saw_0rtt = server_saw_0rtt_rx.await.expect("server task dropped without reporting");
     assert!(
         server_saw_0rtt,
@@ -305,25 +301,11 @@ async fn quic_mls_loopback_0rtt_echo() {
          0-RTT decryption failed and the data silently fell back to 1-RTT retransmission"
     );
 
-    // Secondary: quinn-proto's own accepted_0rtt flag. Note this is driven
-    // entirely by the CLIENT's early_data_accepted(), which in this Session
-    // is a static `Some(true)` policy flag since 0-RTT is the only mode --
-    // it does not by itself prove the server decrypted anything (see
-    // early_data_accepted in session.rs). The assertion above is the one
-    // that actually catches a broken server-side key.
+   
     assert!(zero_rtt_accepted.await, "server must accept the 0-RTT data");
 }
 
-// Regression test for the write_handshake() epoch race: before the fix,
-// derive_mls_keys(self.group.as_ref(), ...) inside write_handshake() read
-// whatever epoch the group was CURRENTLY on, live, with no synchronization
-// against the app. Reproduces the exact sequence that broke testbed-runner
-// under --zero-rtt: the app calls create_commit() on the shared group
-// immediately after into_0rtt() returns, before the connection has
-// confirmed and before Bob has any chance to apply anything. With keys
-// pinned at MlsSession construction, the racing commit must not affect the
-// already-derived Handshake/1-RTT keys, and the connection must still
-// complete and decrypt correctly on both sides.
+
 #[tokio::test]
 async fn quic_mls_0rtt_create_commit_race_before_handshake_confirms() {
     init_tracing();
@@ -336,9 +318,7 @@ async fn quic_mls_0rtt_create_commit_race_before_handshake_confirms() {
     alice_group.apply_pending_commit().unwrap();
     let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
 
-    // Shared: MlsClientConfig gets one Arc clone (used internally to pin
-    // this side's handshake/1-RTT keys), the test keeps another to race a
-    // create_commit() against that pinning.
+    
     let alice_group = Arc::new(Mutex::new(alice_group));
 
     let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
@@ -368,8 +348,7 @@ async fn quic_mls_0rtt_create_commit_race_before_handshake_confirms() {
         .into_0rtt()
         .unwrap_or_else(|_| panic!("0-RTT keys must be available from the shared MLS epoch"));
 
-    // The race: advance Alice's epoch immediately, before the connection
-    // has confirmed and before Bob has any chance to apply anything.
+  
     alice_group.lock().unwrap().create_commit().unwrap();
 
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -532,17 +511,14 @@ fn quic_mls_fell_off_back() {
         alice_group.create_commit().unwrap();
     }
 
-    // Simulate an earlier round where Bob already confirmed up through
-    // epoch 5 (a prior Report caused Alice to trim) epochs 1-5,
-    // including epoch 4, are now gone from her log; only 6 remains.
+    
     alice_group.trim(5);
     assert_eq!(alice_group.checkpoint(), 5);
     let window = alice_group.window_bytes();
     assert_eq!(window, vec![window[0].clone()]); // sanity: only one entry
     assert_eq!(window[0].0, 6);
 
-    // But Bob's own tracked position is only local_epoch == 3 -- he still
-    // needs epoch 4 next, and it no longer exists anywhere to send him.
+
     let mut local_epoch = 3u64;
 
     let result = apply_commit_window(&mut bob_raw, &window, &mut local_epoch);
