@@ -207,7 +207,7 @@ async fn wait_for_file(path: &Path, poll: Duration) -> Vec<u8> {
     }
 }
 
-async fn wait_for_ready(path: &Path, after: u64, poll: Duration) -> u64 {
+async fn wait_for_ready(path: &Path, after: u64, poll: Duration, timeout: Duration) -> u64 {
     tracing::info!(after, ?timeout, "waiting for peer ready-cycle file");
     let start = Instant::now();
     loop {
@@ -455,7 +455,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     while scenario_start.elapsed() < args.duration {
-        last_ready_seen = wait_for_ready(&ready_path, last_ready_seen, Duration::from_millis(20)).await;
+        last_ready_seen = wait_for_ready(&ready_path, last_ready_seen, Duration::from_millis(20), args.report_timeout).await;
 
         cycle += 1;
         let t0 = Instant::now();
