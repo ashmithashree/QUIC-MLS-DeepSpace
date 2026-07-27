@@ -14,5 +14,5 @@ pub use config::{MlsClientConfig, MlsServerConfig};
 pub use group::{ExportSecret, CommitLog, apply_commit_window, CommitWindowError};
 pub use preamble::{CommitSink, PreambleSocket};
 pub use session::MlsSession;
-pub use control::{ControlMessage, read_message, write_message, send_window_and_trim, run_commit_receiver};
+pub use control::{ControlMessage, read_message, write_message, run_report_sender, run_report_receiver};
 pub use transcript::{encode_transcript, decode_transcript, TranscriptDecodeError};

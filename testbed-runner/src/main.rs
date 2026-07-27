@@ -14,7 +14,7 @@ use mls_rs::{
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
 use quic_mls::{
-    apply_commit_window, run_commit_receiver, send_window_and_trim, CommitLog, CommitSink,
+    apply_commit_window, run_report_receiver, run_report_sender, CommitLog, CommitSink,
     ExportSecret, MlsClientConfig, MlsServerConfig, ControlMessage, PreambleSocket, write_message,
 };
 use quinn::{AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, IdleTimeout, ServerConfig, TransportConfig};
@@ -272,14 +272,20 @@ async fn bootstrap_alice(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
 async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let bob_group = bootstrap_bob(&args.bootstrap_dir).await;
     let bob_group = Arc::new(Mutex::new(bob_group));
-    // Shared between the preamble socket's sink (handshake-adjacent catch-up,
-    // applied as soon as a preamble datagram decodes, independent of and not
-    // synchronized with MlsSession::read_handshake/write_handshake -- see the
-    // race-condition note in the plan this was built from) and
-    // run_commit_receiver (steady-state catch-up, post-handshake) below --
-    // the same counter, so the two mechanisms agree on how far behind Bob
-    // is instead of racing or double-applying.
+    // Applied by the preamble socket's sink below as soon as a preamble
+    // datagram decodes, independent of and not synchronized with
+    // MlsSession::read_handshake/write_handshake -- see the race-condition
+    // note in the plan this was built from. The sink is now the *only*
+    // writer of this counter: the commit window arrives exclusively as a
+    // preamble datagram in both scenarios (steady state and post-blackout
+    // reconnect), so there is no second, stream-based path racing it anymore.
     let local_epoch = Arc::new(Mutex::new(0u64));
+    // Fed by the preamble sink below, drained by run_report_sender: the only
+    // remaining signal that used to be "a CommitWindow arrived over the
+    // control stream" now that the commit window travels exclusively as a
+    // preamble datagram in both scenarios (see PreambleSocket::send_preamble
+    // call sites in run_alice). Report stays on the control stream.
+    let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
 
     let mode = "0rtt";
     let mut out = Telemetry::open(&args.out_path, mode).await?;
@@ -310,39 +316,48 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // at any time -- idempotency is the only thing preventing that from
     // being reapplied or causing confusion (see PreambleSocket's docs).
     //
-    // Lock order MUST match run_commit_receiver's (control.rs: group, then
-    // local_epoch) exactly. This sink runs synchronously inside
-    // PreambleSocket::poll_recv, which the endpoint driver calls for the
-    // whole lifetime of the socket -- concurrently, by construction, with
-    // run_commit_receiver's steady-state loop on the same two mutexes for
-    // the same connection. Acquiring them in the opposite order here would
-    // be a textbook AB-BA deadlock: run_commit_receiver holding `group` and
-    // waiting on `local_epoch` while this sink holds `local_epoch` and
-    // waits on `group` freezes not just commit application but the entire
-    // endpoint driver, since nothing else can proceed until poll_recv
-    // returns.
+    // This sink runs synchronously inside PreambleSocket::poll_recv, which
+    // the endpoint driver calls for the whole lifetime of the socket. The
+    // AB-BA hazard this lock order (group, then local_epoch) originally
+    // guarded against -- a second task acquiring the same two mutexes in the
+    // opposite order -- no longer exists by construction: run_report_sender
+    // (spawned per-connection below) never locks `bob_group` or
+    // `local_epoch` at all, it only reads `epoch_rx` and writes to the
+    // control stream. This sink is the sole acquirer of both locks now, so
+    // the order is kept for clarity/future-proofing rather than because
+    // anything else contends for it today.
     let sink: CommitSink = {
         let bob_group = Arc::clone(&bob_group);
         let local_epoch = Arc::clone(&local_epoch);
+        let epoch_tx = epoch_tx.clone();
         Arc::new(move |window: &[(u64, Vec<u8>)]| {
-            let mut group = bob_group.lock().unwrap();
-            let mut epoch = local_epoch.lock().unwrap();
-            let before = *epoch;
-            match apply_commit_window(&mut *group, window, &mut epoch) {
-                Ok(()) if *epoch != before => {
-                    tracing::info!(
-                        from_epoch = before,
-                        to_epoch = *epoch,
-                        "quic-mls: applied preamble commit window"
-                    );
+            let (new_epoch, changed) = {
+                let mut group = bob_group.lock().unwrap();
+                let mut epoch = local_epoch.lock().unwrap();
+                let before = *epoch;
+                match apply_commit_window(&mut *group, window, &mut epoch) {
+                    Ok(()) if *epoch != before => {
+                        tracing::info!(
+                            from_epoch = before,
+                            to_epoch = *epoch,
+                            "quic-mls: applied preamble commit window"
+                        );
+                    }
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            local_epoch = *epoch,
+                            "quic-mls: could not apply preamble commit window: {e}"
+                        );
+                    }
                 }
-                Ok(()) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        local_epoch = *epoch,
-                        "quic-mls: could not apply preamble commit window: {e}"
-                    );
-                }
+                (*epoch, *epoch != before)
+            };
+            // Notify run_report_sender outside the group/local_epoch locks --
+            // must match the lock order documented above, and send_replace
+            // never blocks on a listener anyway.
+            if changed {
+                epoch_tx.send_replace(new_epoch);
             }
         })
     };
@@ -383,28 +398,32 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let is_0rtt = recv.is_0rtt();
+        // Nothing meaningful arrives from Alice on this stream anymore --
+        // the commit window travels as a preamble datagram now, and Hello
+        // was only ever used for the is_0rtt check above -- so the receive
+        // half is intentionally left unread rather than spawning a reader
+        // for it.
+        drop(recv);
 
         out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
         out.row(if is_0rtt { "control_stream_0rtt" } else { "control_stream_1rtt" }, 0, 0, 0.0).await?;
         zero_rtt_accepted.await;
         let event = if cycle == 1 { "handshake_confirmed" } else { "reconnect_handshake_confirmed" };
-        // By this point MlsSession::read_handshake has already applied any
-        // transcript embedded in the peer's Initial flight, so local_epoch
-        // reflects handshake-time catch-up, not just steady-state trickle.
+        // local_epoch reflects whatever the preamble sink has applied so far --
+        // independent of and not synchronized with this handshake, per the
+        // race-condition note on the sink above.
         let epoch_now = *local_epoch.lock().unwrap();
         out.row(event, epoch_now, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
 
         let should_report = Arc::new(AtomicBool::new(true));
-        let recv_task = tokio::spawn(run_commit_receiver(
-            Arc::clone(&bob_group),
+        let report_task = tokio::spawn(run_report_sender(
             send,
-            recv,
+            epoch_rx.clone(),
             should_report,
-            Arc::clone(&local_epoch),
         ));
 
         let _ = conn.closed().await;
-        recv_task.abort();
+        report_task.abort();
 
         if args.blackout_off.is_zero() {
             break;
@@ -460,7 +479,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         cycle += 1;
         let t0 = Instant::now();
 
-        let (conn, mut send, mut recv) = if cycle == 1 {
+        let (conn, _send, recv) = if cycle == 1 {
             let connecting = endpoint.connect_with(make_client_config(idle), peer_addr, "localhost")?;
             let (conn, zero_rtt_accepted) = connecting
                 .into_0rtt()
@@ -512,8 +531,8 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
             // Alice never blocks waiting on Bob to catch up (invariant 1):
             // a failed cycle just moves on to the next contact window. Her
-            // commit log is untouched (checkpoint/trim only ever advance
-            // via a successful Report round trip in send_window_and_trim),
+            // commit log is untouched (checkpoint/trim only ever advance via
+            // a Report picked up opportunistically by run_report_receiver),
             // so the next attempt offers an equal-or-larger window.
             let (conn, send, recv, ok) = match connect_result {
                 Ok(Ok(v)) => v,
@@ -539,12 +558,12 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             (conn, send, recv)
         };
 
-        if cycle > 1 {
-            let t_flush = Instant::now();
-            let bytes_sent = send_window_and_trim(&alice_group, &mut send, &mut recv, args.report_timeout).await?;
-            out.row("blackout_recovery_flush", epoch, bytes_sent as u64, t_flush.elapsed().as_secs_f64() * 1000.0)
-                .await?;
-        }
+        // Report is purely optional and asynchronous now, in both scenarios:
+        // picked up opportunistically off the control stream whenever Bob
+        // happens to send one, and used only to trim the commit log -- never
+        // awaited before Alice's next action (next commit, force_key_update,
+        // next reconnect attempt).
+        let report_task = tokio::spawn(run_report_receiver(Arc::clone(&alice_group), recv));
 
         let phase_start = Instant::now();
         let on_duration = if args.blackout_on.is_zero() {
@@ -571,7 +590,13 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let cpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
             epoch += 1;
             let t2 = Instant::now();
-            let bytes_sent = send_window_and_trim(&alice_group, &mut send, &mut recv, args.report_timeout).await?;
+            // Unified with the reconnect case: the current window is always
+            // sent as a fire-and-forget preamble datagram, never awaited --
+            // see the reconnect branch above for the identical call.
+            let window = alice_group.lock().unwrap().window_bytes();
+            let bytes_sent = preamble_socket
+                .send_preamble(peer_addr, &window, args.transcript_max_bytes)
+                .await?;
             conn.force_key_update();
             let net_ms = t2.elapsed().as_secs_f64() * 1000.0;
             out.row("commit_cpu", epoch, 0, cpu_ms).await?;
@@ -579,6 +604,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         conn.close(0u32.into(), b"blackout");
+        report_task.abort();
 
         if args.blackout_off.is_zero() || scenario_start.elapsed() >= args.duration {
             break;

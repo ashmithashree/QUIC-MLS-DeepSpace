@@ -1,6 +1,5 @@
 
 pub enum ControlMessage{
-    CommitWindow(Vec<(u64, Vec<u8>)>) ,
     Report(u64),
     Hello,
 }
@@ -8,15 +7,6 @@ pub enum ControlMessage{
 fn encode(msg: &ControlMessage) -> Vec<u8>{
     let mut buf = Vec::new();
     match msg {
-        ControlMessage::CommitWindow(w) => {
-            buf.push(0x01);
-            buf.extend_from_slice(&(w.len() as u64).to_be_bytes());
-            for (epoch, bytes) in w {
-                buf.extend_from_slice(&epoch.to_be_bytes());
-                buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
-                buf.extend_from_slice(bytes);
-            }
-        }
         ControlMessage::Report(epoch) => {
             buf.push(0x02);
             buf.extend_from_slice(&epoch.to_be_bytes());
@@ -31,22 +21,9 @@ use tokio::io::AsyncReadExt;
 
 //decoding function for ControlMessage
 pub async fn read_message(recv: &mut quinn::RecvStream) -> std::io::Result<ControlMessage>{
-    
+
     let msg_type = recv.read_u8().await?;
     match msg_type {
-        0x01 => {
-            let mut w = Vec::new();
-            let count = recv.read_u64().await?;
-            for _ in 0..count {
-                let epoch = recv.read_u64().await?;
-                let len = recv.read_u32().await? as usize;
-                let mut bytes = vec![0u8; len];
-                recv.read_exact(&mut bytes).await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, e.to_string()))?;
-                w.push((epoch, bytes));
-            }
-            Ok(ControlMessage::CommitWindow(w))
-        }
         0x02 => {
             let epoch = recv.read_u64().await?;
             Ok(ControlMessage::Report(epoch))
@@ -64,63 +41,55 @@ pub async fn write_message(send: &mut quinn::SendStream, msg: &ControlMessage) -
     Ok(n)
 }
 
-use crate::group::{CommitLog, ExportSecret, apply_commit_window};
+use crate::group::{CommitLog, ExportSecret};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
-
-pub async fn send_window_and_trim<G: ExportSecret>(
-    commit_log: &Arc<Mutex<CommitLog<G>>>,
-    ctrl_send: &mut quinn::SendStream,
-    ctrl_recv: &mut quinn::RecvStream,
-    timeout: Duration,
-) -> std::io::Result<usize> {
-    let window = commit_log.lock().unwrap().window_bytes();
-    if window.is_empty() {
-        return Ok(0);
-    }
-    let bytes_sent = write_message(ctrl_send, &ControlMessage::CommitWindow(window)).await?;
-    match tokio::time::timeout(timeout, read_message(ctrl_recv)).await {
-        Ok(Ok(ControlMessage::Report(k))) => {
-            commit_log.lock().unwrap().trim(k);
-        }
-        _ => {} // timeout or error: leave untrimmed, will retry next cycle
-    }
-    Ok(bytes_sent)
-}
-
-
-pub async fn run_commit_receiver<G: ExportSecret + 'static>(
-    group: Arc<Mutex<G>>,
-    mut ctrl_send: quinn::SendStream,
+/// Alice's side of the unified recovery mechanism: the commit window itself
+/// travels exclusively as a [`crate::preamble::PreambleSocket::send_preamble`]
+/// datagram now (steady state and post-blackout reconnect alike -- see
+/// preamble.rs and the testbed-runner call sites), so the only thing left on
+/// the control stream in this direction is `Report`. This task never gates
+/// anything: it just applies whatever `Report` arrives, whenever it arrives,
+/// bounding how much of the commit log stays un-trimmed. `trim`'s own
+/// `max`/`min` clamps (group.rs) are what make an out-of-order or duplicate
+/// `Report` harmless here.
+pub async fn run_report_receiver<G: ExportSecret + 'static>(
+    commit_log: Arc<Mutex<CommitLog<G>>>,
     mut ctrl_recv: quinn::RecvStream,
-    should_report: Arc<AtomicBool>,
-    local_epoch: Arc<Mutex<u64>>,
 ) {
     loop {
         match read_message(&mut ctrl_recv).await {
-            Ok(ControlMessage::CommitWindow(w)) => {
-                let reported_epoch = {
-                    let mut guard = group.lock().unwrap();
-                    let mut epoch_guard = local_epoch.lock().unwrap();
-                    if apply_commit_window(&mut *guard, &w, &mut *epoch_guard).is_err() {
-                        break;
-                    }
-                    *epoch_guard
-                };
-                if should_report.load(Ordering::SeqCst) {
-                    if write_message(&mut ctrl_send, &ControlMessage::Report(reported_epoch))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
+            Ok(ControlMessage::Report(k)) => {
+                commit_log.lock().unwrap().trim(k);
             }
-            Ok(ControlMessage::Report(_)) => {}
             Ok(ControlMessage::Hello) => {}
             Err(_) => break,
+        }
+    }
+}
+
+/// Bob's side: reactively reports `local_epoch` back to Alice over the
+/// control stream whenever it changes (driven by the preamble sink applying
+/// a commit window -- see run_bob's `epoch_tx`), instead of replying to a
+/// `CommitWindow` that no longer arrives on this stream. Reports the current
+/// epoch once on start, then again on every subsequent change; never blocks
+/// on Alice reading it, and a lost/ignored `Report` costs nothing beyond a
+/// larger window on Alice's next round.
+pub async fn run_report_sender(
+    mut ctrl_send: quinn::SendStream,
+    mut epoch_rx: tokio::sync::watch::Receiver<u64>,
+    should_report: Arc<AtomicBool>,
+) {
+    loop {
+        let epoch = *epoch_rx.borrow_and_update();
+        if should_report.load(Ordering::SeqCst)
+            && write_message(&mut ctrl_send, &ControlMessage::Report(epoch)).await.is_err()
+        {
+            break;
+        }
+        if epoch_rx.changed().await.is_err() {
+            break;
         }
     }
 }
