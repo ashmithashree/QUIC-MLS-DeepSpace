@@ -36,10 +36,15 @@ pub async fn echo(
         .add(cert_der)
         .map_err(|e| Error::ClientConfig(e.to_string()))?;
 
-    let client_config = ClientConfig::with_root_certificates(Arc::new(roots))
+    let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))
         .map_err(|e| Error::ClientConfig(e.to_string()))?;
 
-    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0)))?;
+    // Same WSL2 GSO workaround as the server side.
+    let mut transport = quinn::TransportConfig::default();
+    transport.enable_segmentation_offload(false);
+    client_config.transport_config(Arc::new(transport));
+
+    let mut endpoint = Endpoint::client(SocketAddr::from(([0, 0, 0, 0], 0)))?;
     endpoint.set_default_client_config(client_config);
 
     let conn = endpoint.connect(server_addr, "localhost")?.await?;

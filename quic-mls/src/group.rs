@@ -12,6 +12,15 @@ pub trait ExportSecret: Send + Sync {
     fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError>;
     fn apply_commit(&mut self, commit: &[u8]) -> Result<(), mls_rs::error::MlsError>;
     fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError>;
+
+    // The commit-transcript window a sender would embed in its next
+    // handshake (Fig. 2's `ast'`). Default empty: a plain `Group` (e.g. Bob,
+    // who never originates commits in this testbed) has nothing to offer.
+    // Only `CommitLog` overrides this with its real, checkpoint-bounded
+    // window.
+    fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
+        Vec::new()
+    }
 }
 // this calls the mls_rs::Group methods to export secrets, process_incoming_message and apply commits.
 impl<C: mls_rs::client_builder::MlsConfig> ExportSecret for mls_rs::Group<C> {
@@ -34,12 +43,7 @@ impl<C: mls_rs::client_builder::MlsConfig> ExportSecret for mls_rs::Group<C> {
         commit_output.commit_message.to_bytes()
     }
 }
-//MlsClientConfig::new(Box::new(alice_group)) takes ownership of alice_group gets moved into the config, then into the live connection.  
-//Once that happens, test code has no way to reach it again but we need to do for rekey so this 
-//nstead of giving the config the Group directly, wrap it in Arc<Mutex<Group<...>>> first. 
-//Arc lets to hold multiple owners of the same data; Mutex lets to mutate it safely from multiple places. 
-//the config a clone of the Arc so the live MlsSession can call export_secret
-// this is outer layer of export_secret that locks the mutex and calls the inner Group's export_secret.
+
 impl<G: ExportSecret> ExportSecret for Arc<Mutex<G>> {
     fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError> {
         self.lock().unwrap().export_secret(label, context, len)
@@ -51,6 +55,10 @@ impl<G: ExportSecret> ExportSecret for Arc<Mutex<G>> {
 
     fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError> {
         self.lock().unwrap().create_commit()
+    }
+
+    fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
+        self.lock().unwrap().pending_commit_window()
     }
 }
 
@@ -68,7 +76,28 @@ impl<G: ExportSecret> ExportSecret for CommitLog<G> {
         self.commit_log.insert(self.current_epoch, bytes.clone());
         Ok(bytes)
     }
-    
+
+    fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
+        self.window_bytes()
+    }
+}
+
+impl ExportSecret for Box<dyn ExportSecret> {
+    fn export_secret(&self, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        (**self).export_secret(label, context, len)
+    }
+
+    fn apply_commit(&mut self, commit: &[u8]) -> Result<(), mls_rs::error::MlsError> {
+        (**self).apply_commit(commit)
+    }
+
+    fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError> {
+        (**self).create_commit()
+    }
+
+    fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
+        (**self).pending_commit_window()
+    }
 }
 impl<G: ExportSecret> CommitLog<G> {
    pub fn new(inner: G) -> Self {
@@ -96,6 +125,10 @@ impl<G: ExportSecret> CommitLog<G> {
     pub fn checkpoint(&self) -> u64 {
         self.checkpoint
     }
+
+    pub fn current_epoch(&self) -> u64 {
+        self.current_epoch
+    }
 }
 /// Error returned by [`apply_commit_window`].
 #[derive(Debug)]
@@ -119,10 +152,7 @@ impl std::fmt::Display for CommitWindowError {
 
 impl std::error::Error for CommitWindowError {}
 
-/// Processes a received commit window on the receiver side.
-///
-/// Stale entries (epoch ≤ current) are silently skipped.  A gap or a
-/// malformed commit returns an error; the caller must trigger a full resync.
+
 pub fn apply_commit_window(
     group: &mut dyn ExportSecret,
     window: &[(u64, Vec<u8>)],

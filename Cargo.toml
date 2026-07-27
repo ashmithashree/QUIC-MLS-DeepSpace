@@ -1,5 +1,5 @@
 [workspace]
-members  = ["echo-server", "echo-client", "mls-demo","quic-mls"]
+members  = ["echo-server", "echo-client", "mls-demo","quic-mls","testbed-runner"]
 resolver = "2"
 
 [workspace.dependencies]

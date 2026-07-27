@@ -5,8 +5,13 @@ use mls_rs::{
     CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList,
 };
 use mls_rs_crypto_rustcrypto::RustCryptoProvider;
-use quic_mls::{MlsClientConfig, MlsServerConfig, ExportSecret, CommitLog, send_window_and_trim, run_commit_receiver,apply_commit_window, CommitWindowError};
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quic_mls::{
+    MlsClientConfig, MlsServerConfig, ExportSecret, CommitLog, CommitSink, PreambleSocket,
+    run_report_sender, run_report_receiver, apply_commit_window, CommitWindowError,
+    ControlMessage, write_message,
+};
+use quinn::{AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, ServerConfig};
+use std::sync::atomic::AtomicBool;
 
 const CS: CipherSuite = CipherSuite::CURVE25519_AES128;
 // Initialize tracing for logging
@@ -53,7 +58,9 @@ where
     A: ExportSecret + 'static,
     B: ExportSecret + 'static,
 {
-    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(Arc::clone(bob_group)))));
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
+        Box::new(Arc::clone(bob_group)),
+    )));
     let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(alice_group)))));
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
@@ -67,15 +74,106 @@ fn make_commit_For_Alice(alice_group: &Arc<Mutex<CommitLog<impl ExportSecret + '
     }
 }
 
-async fn connect_with_control(
-    client_config: ClientConfig,
-    server_addr: SocketAddr,
-) -> (quinn::Connection, quinn::SendStream, quinn::RecvStream) {
-    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    endpoint.set_default_client_config(client_config);
-    let conn = endpoint.connect(server_addr, "localhost").unwrap().await.unwrap();
-    let (ctrl_send, ctrl_recv) = conn.open_bi().await.unwrap();
-    (conn, ctrl_send, ctrl_recv)
+// `PreambleSocket`'s marker relies on the QUIC fixed bit never being greased
+// off -- see preamble.rs's module docs. Required on both endpoints wherever
+// a PreambleSocket is used, mirroring testbed-runner's own helper.
+fn endpoint_config_without_quic_bit_greasing() -> EndpointConfig {
+    let mut cfg = EndpointConfig::default();
+    cfg.grease_quic_bit(false);
+    cfg
+}
+
+/// Builds a preamble-capable QUIC pair: Bob's endpoint wraps a real UDP
+/// socket in a `PreambleSocket` whose sink applies an incoming commit window
+/// directly to `bob_group` and republishes `local_epoch` on the returned
+/// watch channel (mirroring run_bob's `epoch_tx`/`sink` wiring in
+/// testbed-runner). Alice's endpoint gets the concrete `PreambleSocket`
+/// handle back so tests can call `send_preamble` directly, exactly as
+/// run_alice does for every commit window now (steady state and blackout
+/// recovery alike -- there is no other path in the unified design).
+async fn make_preamble_pair<A, B>(
+    alice_group: &Arc<Mutex<CommitLog<A>>>,
+    bob_group: &Arc<Mutex<B>>,
+) -> (
+    Endpoint,
+    Arc<PreambleSocket>,
+    ClientConfig,
+    Endpoint,
+    SocketAddr,
+    Arc<Mutex<u64>>,
+    tokio::sync::watch::Receiver<u64>,
+)
+where
+    A: ExportSecret + 'static,
+    B: ExportSecret + 'static,
+{
+    let local_epoch = Arc::new(Mutex::new(0u64));
+    let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+
+    let sink: CommitSink = {
+        let bob_group = Arc::clone(bob_group);
+        let local_epoch = Arc::clone(&local_epoch);
+        let epoch_tx = epoch_tx.clone();
+        Arc::new(move |window: &[(u64, Vec<u8>)]| {
+            let (new_epoch, changed) = {
+                let mut group = bob_group.lock().unwrap();
+                let mut epoch = local_epoch.lock().unwrap();
+                let before = *epoch;
+                let _ = apply_commit_window(&mut *group, window, &mut epoch);
+                (*epoch, *epoch != before)
+            };
+            if changed {
+                epoch_tx.send_replace(new_epoch);
+            }
+        })
+    };
+
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
+        Box::new(Arc::clone(bob_group)),
+    )));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(alice_group)))));
+
+    let bob_io = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let bob_preamble: Arc<dyn AsyncUdpSocket> = Arc::new(PreambleSocket::new(bob_io, Some(sink)));
+    let bob_endpoint = Endpoint::new_with_abstract_socket(
+        endpoint_config_without_quic_bit_greasing(),
+        Some(server_config),
+        bob_preamble,
+        quinn::default_runtime().expect("tokio runtime available"),
+    ).unwrap();
+    let bob_addr = bob_endpoint.local_addr().unwrap();
+
+    let alice_io = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let alice_preamble = Arc::new(PreambleSocket::new(alice_io, None));
+    let alice_endpoint = Endpoint::new_with_abstract_socket(
+        endpoint_config_without_quic_bit_greasing(),
+        None,
+        Arc::clone(&alice_preamble) as Arc<dyn AsyncUdpSocket>,
+        quinn::default_runtime().expect("tokio runtime available"),
+    ).unwrap();
+
+    (alice_endpoint, alice_preamble, client_config, bob_endpoint, bob_addr, local_epoch, epoch_rx)
+}
+
+/// Polls `commit_log`'s checkpoint until it reaches `target` or `timeout`
+/// elapses. Report is picked up opportunistically now (never awaited
+/// synchronously -- see run_report_receiver), so tests observe its effect
+/// by polling rather than by a single blocking call.
+async fn wait_until_checkpoint<G: ExportSecret>(
+    commit_log: &Arc<Mutex<CommitLog<G>>>,
+    target: u64,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if commit_log.lock().unwrap().checkpoint() >= target {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 //---------------------------------------Integration tests for QUIC-MLS---------------------------------------------
@@ -93,7 +191,9 @@ async fn quic_mls_loopback_echo() {
     alice_group.apply_pending_commit().unwrap();
     let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
 
-    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(Box::new(bob_group))));
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
+        Box::new(bob_group),
+    )));
     let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(alice_group))));
 
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
@@ -132,18 +232,17 @@ async fn quic_mls_loopback_echo_with_rekey() {
     let (alice_raw, bob_raw) = make_mls_groups();
     let alice_group = Arc::new(Mutex::new(CommitLog::new(alice_raw)));
     let bob_group   = Arc::new(Mutex::new(bob_raw));
-    let (server, server_addr, client_config) = make_quic_pair(&alice_group, &bob_group);
+    let (alice_endpoint, alice_preamble, client_config, bob_endpoint, bob_addr, _bob_local_epoch, bob_epoch_rx) =
+        make_preamble_pair(&alice_group, &bob_group).await;
 
     tokio::spawn(async move {
-        let incoming = server.accept().await.expect("client connected");
+        let incoming = bob_endpoint.accept().await.expect("client connected");
         let conn = incoming.await.expect("handshake completed");
-        //First bi stream is alwaya the control stream.
-        let (ctrl_send, ctrl_recv) = conn.accept_bi().await.expect("control stream");
-
-        //handle commit window and send report in seperate task
-        let bob_group_ctrl = Arc::clone(&bob_group);
-        let always_report = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, always_report));
+        //First bi stream is always the control stream -- Report only now,
+        //the commit window itself arrives as a preamble datagram.
+        let (ctrl_send, _ctrl_recv) = conn.accept_bi().await.expect("control stream");
+        let always_report = Arc::new(AtomicBool::new(true));
+        tokio::spawn(run_report_sender(ctrl_send, bob_epoch_rx, always_report));
         //echo loop for all application data stream.
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             let data = recv.read_to_end(1 << 16).await.expect("read request");
@@ -152,8 +251,10 @@ async fn quic_mls_loopback_echo_with_rekey() {
         }
     });
     // client connection endpoint
-    
-    let (conn, mut ctrl_send, mut ctrl_recv) = connect_with_control(client_config, server_addr).await;
+    let conn = alice_endpoint.connect_with(client_config, bob_addr, "localhost").unwrap().await.unwrap();
+    let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.unwrap();
+    write_message(&mut ctrl_send, &ControlMessage::Hello).await.unwrap();
+    tokio::spawn(run_report_receiver(Arc::clone(&alice_group), ctrl_recv));
 
     //pre-rekey echo
     let (mut send, mut recv) = conn.open_bi().await.unwrap();
@@ -163,10 +264,14 @@ async fn quic_mls_loopback_echo_with_rekey() {
     let response = recv.read_to_end(64).await.unwrap();
     println!("Echo: {}", String::from_utf8_lossy(&response));
     assert_eq!(response, b"Hello, QUIC-MLS!");
-    // Create commit, send the window to Bob, wait for his Report (with timeout) before flipping keys.
+    // Create a commit and fire the window as a preamble datagram -- never
+    // awaited, per the unified send-never-blocks invariant. force_key_update
+    // proceeds immediately; Report (and the resulting trim) lands whenever
+    // Bob's run_report_sender gets to it, asserted separately below.
     make_commit_For_Alice(&alice_group, 1);
-    send_window_and_trim(&alice_group, &mut ctrl_send, &mut ctrl_recv, std::time::Duration::from_secs(5)).await.unwrap();
-    //update the keysin connection
+    let window = alice_group.lock().unwrap().window_bytes();
+    alice_preamble.send_preamble(bob_addr, &window, usize::MAX).await.unwrap();
+    //update the keys in connection
     conn.force_key_update();
     //post-rekey echo
     let (mut send2, mut recv2) = conn.open_bi().await.unwrap();
@@ -175,6 +280,11 @@ async fn quic_mls_loopback_echo_with_rekey() {
     let response2 = recv2.read_to_end(64).await.unwrap();
     println!("Echo after rekey: {}", String::from_utf8_lossy(&response2));
     assert_eq!(response2, b"Hello again, QUIC-MLS!");
+
+    assert!(
+        wait_until_checkpoint(&alice_group, 1, std::time::Duration::from_secs(5)).await,
+        "Bob's Report must eventually trim Alice's commit log"
+    );
 }
 use tokio::time::Duration;
 #[tokio::test]
@@ -246,8 +356,10 @@ async fn quic_mls_loopback_0rtt_echo() {
     alice_group.apply_pending_commit().unwrap();
     let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
 
-    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new_with_early_data(Box::new(bob_group))));
-    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new_with_early_data(Box::new(alice_group))));
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
+        Box::new(bob_group),
+    )));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(alice_group))));
 
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
@@ -271,9 +383,7 @@ async fn quic_mls_loopback_0rtt_echo() {
     let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
     endpoint.set_default_client_config(client_config);
 
-    // into_0rtt() hands back a Connection usable immediately, before the
-    // handshake round trip completes, plus a future that resolves once we
-    // know whether the server accepted the early data.
+
     let (conn, zero_rtt_accepted) = endpoint
         .connect(server_addr, "localhost")
         .unwrap()
@@ -289,9 +399,7 @@ async fn quic_mls_loopback_0rtt_echo() {
     println!("0-RTT echo: {}", String::from_utf8_lossy(&response));
     assert_eq!(response, b"Hello, 0-RTT QUIC-MLS!");
 
-    // Primary proof: the SERVER actually decrypted this stream's data
-    // during 0-RTT, not via a 1-RTT fallback retransmission after the
-    // handshake completed.
+  
     let server_saw_0rtt = server_saw_0rtt_rx.await.expect("server task dropped without reporting");
     assert!(
         server_saw_0rtt,
@@ -299,13 +407,64 @@ async fn quic_mls_loopback_0rtt_echo() {
          0-RTT decryption failed and the data silently fell back to 1-RTT retransmission"
     );
 
-    // Secondary: quinn-proto's own accepted_0rtt flag. Note this is driven
-    // entirely by the CLIENT's early_data_accepted(), which in this Session
-    // is a static `Some(self.early_data)` policy flag -- it does not by
-    // itself prove the server decrypted anything (see early_data_accepted
-    // in session.rs). The assertion above is the one that actually catches
-    // a broken server-side key.
+   
     assert!(zero_rtt_accepted.await, "server must accept the 0-RTT data");
+}
+
+
+#[tokio::test]
+async fn quic_mls_0rtt_create_commit_race_before_handshake_confirms() {
+    init_tracing();
+    let alice = make_client("alice");
+    let bob = make_client("bob");
+
+    let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
+    let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
+    alice_group.apply_pending_commit().unwrap();
+    let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
+
+    
+    let alice_group = Arc::new(Mutex::new(alice_group));
+
+    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
+        Box::new(bob_group),
+    )));
+    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)))));
+
+    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let incoming = server.accept().await.expect("client connected").accept().expect("accept");
+        let (conn, _established) = incoming.into_0rtt().unwrap_or_else(|_| unreachable!());
+        let (mut send, mut recv) = conn.accept_bi().await.expect("client opened a stream");
+        let data = recv.read_to_end(1 << 16).await.expect("read request");
+        send.write_all(&data).await.expect("write response");
+        send.finish().expect("finish response stream");
+        conn.closed().await;
+    });
+
+    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    let (conn, zero_rtt_accepted) = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .into_0rtt()
+        .unwrap_or_else(|_| panic!("0-RTT keys must be available from the shared MLS epoch"));
+
+  
+    alice_group.lock().unwrap().create_commit().unwrap();
+
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    send.write_all(b"Hello after a racing commit!").await.unwrap();
+    send.finish().unwrap();
+
+    let response = recv.read_to_end(64).await.unwrap();
+    assert_eq!(response, b"Hello after a racing commit!");
+
+    assert!(zero_rtt_accepted.await, "connection must still complete despite the racing commit");
 }
 //---------------------------------------Acceptance tests for Quic MLS-------------------------------------------------------------------
 // this is a bidirectional stream that is opened first on both sides of the connection and is used to send commit windows and reports between the client and server.
@@ -315,30 +474,39 @@ async fn quic_mls_single_blackout_no_report(){
     let (alice_raw, bob_raw) = make_mls_groups();
     let alice_group = Arc::new(Mutex::new(CommitLog::new(alice_raw)));
     let bob_group   = Arc::new(Mutex::new(bob_raw));
-    let (server, server_addr, client_config) = make_quic_pair(&alice_group, &bob_group);  
-    // make handshake and open a bidirectional stream
+    let (alice_endpoint, alice_preamble, client_config, bob_endpoint, bob_addr, _bob_local_epoch, bob_epoch_rx) =
+        make_preamble_pair(&alice_group, &bob_group).await;
     tokio::spawn(async move {
-        let incoming = server.accept().await.expect("client connected");
+        let incoming = bob_endpoint.accept().await.expect("client connected");
         let conn = incoming.await.expect("handshake completed");
-        // First bi stream is the control stream.
-        let (ctrl_send, ctrl_recv) = conn.accept_bi().await.expect("control stream");
-        let bob_group_ctrl = Arc::clone(&bob_group);
-        let no_report = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, no_report));
+        let (ctrl_send, _ctrl_recv) = conn.accept_bi().await.expect("control stream");
+        let no_report = Arc::new(AtomicBool::new(false));
+        tokio::spawn(run_report_sender(ctrl_send, bob_epoch_rx, no_report));
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             let data = recv.read_to_end(1 << 16).await.expect("read request");
             send.write_all(&data).await.expect("write response");
             send.finish().expect("finish response stream");
         }
     });
-    let (conn, mut ctrl_send, mut ctrl_recv) = connect_with_control(client_config, server_addr).await;
+    let conn = alice_endpoint.connect_with(client_config, bob_addr, "localhost").unwrap().await.unwrap();
+    let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.unwrap();
+    write_message(&mut ctrl_send, &ControlMessage::Hello).await.unwrap();
+    tokio::spawn(run_report_receiver(Arc::clone(&alice_group), ctrl_recv));
+
     // Blackout: Alice creates 3 commits while Bob is not reporting back.
     make_commit_For_Alice(&alice_group, 3);
     // Window contains all 3 commits since checkpoint is still 0.
     assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 3);
-    // Send the full window; timeout when no Report comes back (return link down).
-    send_window_and_trim(&alice_group, &mut ctrl_send, &mut ctrl_recv, std::time::Duration::from_millis(100)).await.unwrap();
-    // Checkpoint must still be 0 — nothing trimmed because no Report arrived.
+    // Send the full window as a fire-and-forget preamble datagram -- Bob
+    // applies it (his epoch does advance) but never reports back.
+    let window = alice_group.lock().unwrap().window_bytes();
+    alice_preamble.send_preamble(bob_addr, &window, usize::MAX).await.unwrap();
+    // Give Bob's sink + (suppressed) report path a moment to run, then
+    // confirm nothing was ever trimmed -- there is no Report to wait for.
+    assert!(
+        !wait_until_checkpoint(&alice_group, 1, std::time::Duration::from_millis(300)).await,
+        "checkpoint must never advance when Bob never reports"
+    );
     assert_eq!(alice_group.lock().unwrap().checkpoint(), 0);
     // Window must still be 3 — nothing pruned.
     assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 3);
@@ -349,27 +517,34 @@ async fn quic_mls_single_blackout_with_report(){
     let (alice_raw, bob_raw) = make_mls_groups();
     let alice_group = Arc::new(Mutex::new(CommitLog::new(alice_raw)));
     let bob_group   = Arc::new(Mutex::new(bob_raw));
-    let (server, server_addr, client_config) = make_quic_pair(&alice_group, &bob_group);  
-    // make handshake and open a bidirectional stream
+    let (alice_endpoint, alice_preamble, client_config, bob_endpoint, bob_addr, _bob_local_epoch, bob_epoch_rx) =
+        make_preamble_pair(&alice_group, &bob_group).await;
     tokio::spawn(async move {
-        let incoming = server.accept().await.expect("client connected");
+        let incoming = bob_endpoint.accept().await.expect("client connected");
         let conn = incoming.await.expect("handshake completed");
-        // First bi stream is the control stream.
-        let (ctrl_send, ctrl_recv) = conn.accept_bi().await.expect("control stream");
-        let bob_group_ctrl = Arc::clone(&bob_group);
-        let always_report = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, always_report));
+        let (ctrl_send, _ctrl_recv) = conn.accept_bi().await.expect("control stream");
+        let always_report = Arc::new(AtomicBool::new(true));
+        tokio::spawn(run_report_sender(ctrl_send, bob_epoch_rx, always_report));
     });
-    let (conn, mut ctrl_send, mut ctrl_recv) = connect_with_control(client_config, server_addr).await;
+    let conn = alice_endpoint.connect_with(client_config, bob_addr, "localhost").unwrap().await.unwrap();
+    let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.unwrap();
+    write_message(&mut ctrl_send, &ControlMessage::Hello).await.unwrap();
+    tokio::spawn(run_report_receiver(Arc::clone(&alice_group), ctrl_recv));
+
     // Blackout: Alice creates 3 commits.
     make_commit_For_Alice(&alice_group, 3);
     assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 3);
-    // Send the window — Bob applies all 3 and sends a Report back; Alice trims.
-    send_window_and_trim(&alice_group, &mut ctrl_send, &mut ctrl_recv, std::time::Duration::from_secs(5)).await.unwrap();
-    // Checkpoint must now be 3 — Bob confirmed he reached epoch 3.
-    assert_eq!(alice_group.lock().unwrap().checkpoint(), 3);
+    // Send the window as a preamble datagram — Bob applies all 3 and
+    // reports back reactively; Alice's background receiver trims whenever
+    // that lands.
+    let window = alice_group.lock().unwrap().window_bytes();
+    alice_preamble.send_preamble(bob_addr, &window, usize::MAX).await.unwrap();
+    assert!(
+        wait_until_checkpoint(&alice_group, 3, std::time::Duration::from_secs(5)).await,
+        "checkpoint must reach 3 once Bob's Report is picked up"
+    );
     // Window must be empty — all commits pruned below checkpoint.
-    assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 0);               
+    assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 0);
 }
 
 #[tokio::test]
@@ -377,36 +552,44 @@ async fn quic_mls_two_blackouts(){
     let (alice_raw, bob_raw) = make_mls_groups();
     let alice_group = Arc::new(Mutex::new(CommitLog::new(alice_raw)));
     let bob_group   = Arc::new(Mutex::new(bob_raw));
-    let (server, server_addr, client_config) = make_quic_pair(&alice_group, &bob_group);
+    let (alice_endpoint, alice_preamble, client_config, bob_endpoint, bob_addr, _bob_local_epoch, bob_epoch_rx) =
+        make_preamble_pair(&alice_group, &bob_group).await;
     // Shared flag: true = Bob sends Report, false = Bob stays silent (simulates return link down).
-    let should_report = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let should_report = Arc::new(AtomicBool::new(true));
     let should_report_ctrl = Arc::clone(&should_report);
-    // make handshake and open a bidirectional stream
     tokio::spawn(async move {
-        let incoming = server.accept().await.expect("client connected");
+        let incoming = bob_endpoint.accept().await.expect("client connected");
         let conn = incoming.await.expect("handshake completed");
-        // First bi stream is the control stream.
-        let (ctrl_send, ctrl_recv) = conn.accept_bi().await.expect("control stream");
-        let bob_group_ctrl = Arc::clone(&bob_group);
-        tokio::spawn(run_commit_receiver(bob_group_ctrl, ctrl_send, ctrl_recv, should_report_ctrl));
+        let (ctrl_send, _ctrl_recv) = conn.accept_bi().await.expect("control stream");
+        tokio::spawn(run_report_sender(ctrl_send, bob_epoch_rx, should_report_ctrl));
     });
-    let (conn, mut ctrl_send, mut ctrl_recv) = connect_with_control(client_config, server_addr).await;
-    // black out 1: Alice creates 2 commits and sends them to Bob, who applies them and sends a Report back.
+    let conn = alice_endpoint.connect_with(client_config, bob_addr, "localhost").unwrap().await.unwrap();
+    let (mut ctrl_send, ctrl_recv) = conn.open_bi().await.unwrap();
+    write_message(&mut ctrl_send, &ControlMessage::Hello).await.unwrap();
+    tokio::spawn(run_report_receiver(Arc::clone(&alice_group), ctrl_recv));
+
+    // blackout 1: Alice creates 2 commits and sends them to Bob, who applies them and reports back.
     make_commit_For_Alice(&alice_group, 2);
-    //assert that the window contains 2 commits
     assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 2);
-    // Send the window — Bob applies all 2 and sends a Report back; Alice trims.
-    send_window_and_trim(&alice_group, &mut ctrl_send, &mut ctrl_recv, std::time::Duration::from_secs(5)).await.unwrap();
-    // After blackout 1: window trimmed, checkpoint advanced.
-    assert_eq!(alice_group.lock().unwrap().checkpoint(), 2);
+    let window = alice_group.lock().unwrap().window_bytes();
+    alice_preamble.send_preamble(bob_addr, &window, usize::MAX).await.unwrap();
+    assert!(
+        wait_until_checkpoint(&alice_group, 2, std::time::Duration::from_secs(5)).await,
+        "checkpoint must reach 2 after blackout 1's Report"
+    );
     // Window must be empty — all commits pruned below checkpoint.
     assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 0);
     // Disable reporting before blackout 2.
     should_report.store(false, std::sync::atomic::Ordering::SeqCst);
     make_commit_For_Alice(&alice_group, 3); // epoch 3, 4, 5
     assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 3); // epochs 3,4,5 — checkpoint is still 2
-    // Send window; timeout when no Report arrives (return link down).
-    send_window_and_trim(&alice_group, &mut ctrl_send, &mut ctrl_recv, std::time::Duration::from_millis(100)).await.unwrap();
+    // Send window as a preamble datagram again; no Report arrives this time.
+    let window = alice_group.lock().unwrap().window_bytes();
+    alice_preamble.send_preamble(bob_addr, &window, usize::MAX).await.unwrap();
+    assert!(
+        !wait_until_checkpoint(&alice_group, 3, std::time::Duration::from_millis(300)).await,
+        "checkpoint must not advance past 2 while reporting is disabled"
+    );
     // Checkpoint unchanged, window grew.
     assert_eq!(alice_group.lock().unwrap().checkpoint(), 2);
     assert_eq!(alice_group.lock().unwrap().window_bytes().len(), 3);
@@ -458,17 +641,14 @@ fn quic_mls_fell_off_back() {
         alice_group.create_commit().unwrap();
     }
 
-    // Simulate an earlier round where Bob already confirmed up through
-    // epoch 5 (a prior Report caused Alice to trim) epochs 1-5,
-    // including epoch 4, are now gone from her log; only 6 remains.
+    
     alice_group.trim(5);
     assert_eq!(alice_group.checkpoint(), 5);
     let window = alice_group.window_bytes();
     assert_eq!(window, vec![window[0].clone()]); // sanity: only one entry
     assert_eq!(window[0].0, 6);
 
-    // But Bob's own tracked position is only local_epoch == 3 -- he still
-    // needs epoch 4 next, and it no longer exists anywhere to send him.
+
     let mut local_epoch = 3u64;
 
     let result = apply_commit_window(&mut bob_raw, &window, &mut local_epoch);

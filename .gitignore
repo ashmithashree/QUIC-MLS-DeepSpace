@@ -1,2 +1,6 @@
 /target/
 cert.der
+key
+key.pub
+build.log
+runsteady.sh

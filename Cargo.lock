@@ -1411,6 +1411,7 @@ dependencies = [
  "quinn-proto",
  "sha2",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -1956,6 +1957,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "testbed-runner"
+version = "0.1.0"
+dependencies = [
+ "mls-rs",
+ "mls-rs-crypto-rustcrypto",
+ "quic-mls",
+ "quinn",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
