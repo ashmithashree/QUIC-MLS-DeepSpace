@@ -11,12 +11,16 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-CHANNEL="${1:-leo}"
+CHANNEL="geo"
 COMMIT_INTERVALS=(1 3 5 10)
 BLACKOUT_ON=15
 BLACKOUT_OFF=10
+# 500ms RTT means recovery completes in well under a second; the LEO-scale
+# 90s per-cycle window is ample for several blackout cycles.
 DURATION=90
-REPORT_TIMEOUT=8
+# GEO: 250ms delay each way => ~500ms RTT. LEO-scale timing; 15s report
+# timeout is generous headroom over a sub-second round trip.
+REPORT_TIMEOUT=15
 # Raised from the old 900: under the datagram mechanism this is send_preamble's
 # cumulative total_budget across as-many-datagrams-as-needed, not a single
 # handshake-packet ceiling -- 900 was right for stress-testing the OLD
@@ -35,7 +39,7 @@ echo
 echo "=== 1. Build once ==="
 cargo build --release 2>&1 | tail -30
 
-RESULTS_DIR="./sweep-results/$(date +%Y%m%d-%H%M%S)"
+RESULTS_DIR="./sweep-results-geo/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 echo ""
 echo ">>> RESULTS_DIR = $RESULTS_DIR   <<<  (relative to repo root, NOT /tmp)"

@@ -1,30 +1,61 @@
 #!/usr/bin/env bash
-# Sweeps commit interval over {1,3,5,10}s under a fixed blackout window, on
-# the LEO channel, to check the transcript mechanism's behaviour as the
-# number of missed commits per blackout grows -- the same variable the base
-# paper varies in Table 2 (missed commit count), but here under real
-# tc netem emulation with the actual reconnect handshake, not an isolated
-# single-machine benchmark.
+# Mars-channel smoke test for the datagram preamble reconnection mechanism.
 #
-# Run from repo root: bash test_commit_interval_sweep.sh [channel]
-# channel defaults to leo.
+# Real profile, taken directly from apply_channel.sh (not guessed):
+#   delay=240000ms each direction, jitter=0ms, loss=1%, rate=500kbit
+# -> a full round trip is ~480s (8 minutes) with zero jitter, so the
+# specific reordering risk flagged in review (Finding 2) has far less room
+# to manifest here than on LEO -- there is no per-packet delay variance to
+# cause reordering. Loss-driven retransmission could still reorder things,
+# but that is a narrower, weaker version of the same risk, not the same one.
+#
+# WALL-CLOCK COST: this is NOT a quick test. A single reconnect attempt
+# takes ~8 minutes minimum even with zero loss; with 1% loss and PTO-driven
+# retransmission that can stretch to 15-20 minutes for one cycle. Defaults
+# below run ONLY interval=1, ONE cycle, as a first correctness check --
+# expect this single run to take at least 25-30 minutes wall-clock. Do not
+# default to the full {1,3,5,10} sweep here; each interval added multiplies
+# the wall-clock cost by roughly the same amount.
+#
+# Run from repo root: bash testScriptMars.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
-CHANNEL="${1:-leo}"
+CHANNEL="mars"
+# Only interval=1 by default -- see wall-clock warning above. Widen this
+# array (e.g. to (1 3)) only once a single interval=1 run has passed cleanly
+# and you've budgeted the extra wall-clock time deliberately.
 COMMIT_INTERVALS=(1 3 5 10)
+
+# Kept deliberately small and unchanged from the LEO test: this checks
+# whether the mechanism recovers correctly under Mars's actual per-packet
+# characteristics (delay, loss, rate), not whether it can survive a
+# Mars-scale, hours-long blackout -- that is a separate, much larger backlog
+# question already covered by the transcript-max-bytes analysis. Producing
+# and applying 10 missed commits under real 240s delay is the meaningful
+# test here; a longer blackout only adds wall-clock time without adding
+# new information about the mechanism itself.
 BLACKOUT_ON=15
 BLACKOUT_OFF=10
-DURATION=90
-REPORT_TIMEOUT=8
-# Raised from the old 900: under the datagram mechanism this is send_preamble's
-# cumulative total_budget across as-many-datagrams-as-needed, not a single
-# handshake-packet ceiling -- 900 was right for stress-testing the OLD
-# transport-parameter mechanism's known limit, but left at 900 here it would
-# just truncate the transcript to ~1 commit and produce a false
-# "still livelocked" result, regardless of whether the lock-order fix worked.
-# 20000 comfortably covers a 10-commit backlog (~5,180B at 518B/commit) with
-# margin for the largest interval=1 case.
+
+# A full round trip is ~480s. report-timeout must comfortably exceed that
+# PLUS room for at least one PTO-driven retransmission under 1% loss, or
+# every single attempt will be falsely reported as a failure regardless of
+# whether the mechanism actually works. 900s (15 min) gives ~2 round trips
+# of headroom before giving up on one cycle.
+REPORT_TIMEOUT=900
+
+# Traced directly from a real run: at DURATION=1500, Bob's own scenario
+# clock ran out and his process exited ~4.5 minutes BEFORE Alice's
+# wait_for_ready even finished resolving -- by the time Alice tried to
+# reconnect, nobody was listening. The real critical path is: local
+# blackout_off (10s) + close-notification propagation (~240s) + Bob writing
+# the next cycle marker + Alice's wait_for_ready resolving + the actual
+# reconnect round trip (480s+, more under 1% loss retransmission). 3600s
+# gives comfortable margin for one full cycle including a retry, on both
+# Bob's and Alice's side (they share this value).
+DURATION=3600
+
 TRANSCRIPT_MAX_BYTES=20000
 
 echo "=== 0. Sanity check the datagram preamble mechanism is present ==="
@@ -35,11 +66,12 @@ echo
 echo "=== 1. Build once ==="
 cargo build --release 2>&1 | tail -30
 
-RESULTS_DIR="./sweep-results/$(date +%Y%m%d-%H%M%S)"
+RESULTS_DIR="./sweep-results-mars/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 echo ""
 echo ">>> RESULTS_DIR = $RESULTS_DIR   <<<  (relative to repo root, NOT /tmp)"
-echo ">>>   tail -f $RESULTS_DIR/bob_i1.log"
+echo ">>> This run is on the Mars channel: ~8min RTT, expect ~25-30 min wall-clock."
+echo ">>>   tail -f $RESULTS_DIR/bob_i1.log   (in another terminal, to watch progress)"
 echo ""
 SUMMARY="$RESULTS_DIR/summary.tsv"
 printf "interval_s\tmissed_commits_est\tembedded_bytes\ttranscript_truncated\treconnect_epoch_matched\trecovery_flush_bytes\tverdict\n" > "$SUMMARY"
