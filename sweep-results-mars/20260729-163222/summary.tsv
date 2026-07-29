@@ -2,3 +2,4 @@ interval_s	missed_commits_est	embedded_bytes	transcript_truncated	reconnect_epoc
 1	15	50	no	yes	NONE	LIVELOCK-SUSPECT
 3	5	18	no	yes	NONE	LIVELOCK-SUSPECT
 5	3	5	no	no	NONE	LIVELOCK-SUSPECT
+10	1	6	no	yes	NONE	LIVELOCK-SUSPECT

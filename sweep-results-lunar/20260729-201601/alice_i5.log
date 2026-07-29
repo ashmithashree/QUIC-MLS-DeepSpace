@@ -1,0 +1,10 @@
+[2m2026-07-29T19:20:16.648995Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m0 [3mtimeout[0m[2m=[0m30s
+[2m2026-07-29T19:20:16.670590Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m1 [3melapsed_ms[0m[2m=[0m21
+[2m2026-07-29T19:20:44.249858Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m1 [3mtimeout[0m[2m=[0m30s
+[2m2026-07-29T19:20:44.249975Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m2 [3melapsed_ms[0m[2m=[0m0
+[2m2026-07-29T19:21:11.812385Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m2 [3mtimeout[0m[2m=[0m30s
+[2m2026-07-29T19:21:11.812552Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m3 [3melapsed_ms[0m[2m=[0m0
+[2m2026-07-29T19:21:39.404246Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m3 [3mtimeout[0m[2m=[0m30s
+[2m2026-07-29T19:21:39.404325Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m4 [3melapsed_ms[0m[2m=[0m0
+[2m2026-07-29T19:22:07.006703Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m4 [3mtimeout[0m[2m=[0m30s
+[2m2026-07-29T19:22:07.006843Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m5 [3melapsed_ms[0m[2m=[0m0

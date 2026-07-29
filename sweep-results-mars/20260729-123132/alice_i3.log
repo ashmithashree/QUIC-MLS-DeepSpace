@@ -1,6 +1,0 @@
-[2m2026-07-29T12:15:23.841496Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m0 [3mtimeout[0m[2m=[0m900s
-[2m2026-07-29T12:15:23.862992Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m1 [3melapsed_ms[0m[2m=[0m21
-[2m2026-07-29T12:28:03.669047Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m1 [3mtimeout[0m[2m=[0m900s
-[2m2026-07-29T12:31:53.698879Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m2 [3melapsed_ms[0m[2m=[0m230029
-[2m2026-07-29T12:40:18.838676Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m2 [3mtimeout[0m[2m=[0m900s
-[2m2026-07-29T12:44:08.841556Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m3 [3melapsed_ms[0m[2m=[0m230002
