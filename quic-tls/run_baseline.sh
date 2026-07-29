@@ -1,91 +1,101 @@
 #!/usr/bin/env bash
-# run_baseline.sh — run the QUIC + TLS 1.3 baseline across the four emulated channels.
+# run_tls_baseline.sh — QUIC + TLS 1.3 baseline across an emulated channel.
 #
-# Assumes the same testbed you use for the QUIC-MLS runs:
-#   * network namespaces ns-alice / ns-bob joined by a veth pair (veth-a / veth-b)
-#   * server (ns-bob) at 10.0.0.2, client (ns-alice) at 10.0.0.1
-#   * tc netem applied to veth-b (the bob-side egress) to shape the link
+# Built on the SAME testbed scaffolding as testScriptLeo.sh:
+#   ns-alice (10.200.1.1) <-- veth --> ns-bob (10.200.1.2)
+#   channel shaped by apply_channel.sh on BOTH veth ends (one-way delay each,
+#   so RTT = 2x the profile delay). GSO disabled via ethtool (WSL2 veth bug).
 #
-# It does NOT create the namespaces — your existing setup script does that. It only
-# (re)applies the per-channel netem profile, runs the client against a fresh server,
-# and writes JSONL to results/tls_baseline_<channel>.jsonl.
+# Runs from repo root:   sudo bash run_tls_baseline.sh [channel]   (default: leo)
 #
-# IMPORTANT: the DELAY / LOSS numbers below are placeholders. Set them to the SAME
-# values you used for the QUIC-MLS runs so the two protocols are compared on identical
-# links. Consistency with your MLS profiles matters more than any nominal figure here.
+# For each channel it does two passes:
+#   * resume pass   — 0-RTT allowed (best-case TLS)
+#   * noresume pass — full 1-RTT every reconnect (RFC 8446 ticket-expiry case)
+# Output: JSONL under ./tls-baseline-results/<timestamp>/
 
 set -euo pipefail
+cd "$(dirname "$0")"
 
+CHANNEL="${1:-leo}"
 BIN="./target/release/tls-baseline"
-SERVER_NS="ns-bob"
-CLIENT_NS="ns-alice"
-SERVER_IP="10.0.0.2"
-SERVER_PORT="4443"
-SHAPE_IF="veth-b"          # interface to apply netem on (bob-side)
-RECONNECTS="${RECONNECTS:-16}"
-OUTDIR="results"
 
-mkdir -p "$OUTDIR"
+# Per-channel reconnect count. Mars/Lunar are deliberately small: on the baseline
+# EVERY reconnect is a real handshake at the channel RTT, so a few give a clean mean
+# without an overnight wait (Mars RTT ~= 480s).
+case "$CHANNEL" in
+  leo|geo)   RECONNECTS="${RECONNECTS:-16}" ;;
+  lunar)     RECONNECTS="${RECONNECTS:-6}"  ;;
+  mars)      RECONNECTS="${RECONNECTS:-3}"  ;;
+  *) echo "unknown channel: $CHANNEL (use leo|geo|lunar|mars)"; exit 1 ;;
+esac
+BLACKOUT_MS="${BLACKOUT_MS:-0}"   # short offline gap between reconnects; 0 = back-to-back
 
-# channel  ->  "netem-delay  netem-loss  blackout_ms  rtt_ms_tag"
-# TODO: replace with the exact profiles from your MLS runs.
-#   netem-delay is one-way; RTT is ~2x that on a symmetric veth pair.
-#   rtt_ms_tag is a label only (echoed into each record).
-declare -A PROFILES=(
-  [LEO]="12ms        0.1%   0       25"
-  [GEO]="130ms       0.5%   0       260"
-  [Lunar]="1300ms    1%     15000   2600"
-  [Mars]="360000ms   2%     60000   720000"
-)
+# rtt tag (one-way delay in ms, matching apply_channel.sh) — label only, echoed to output
+declare -A RTT_TAG=( [leo]=16 [geo]=250 [lunar]=1282 [mars]=240000 )
 
-apply_netem() {
-  local delay="$1" loss="$2"
-  ip netns exec "$SERVER_NS" tc qdisc replace dev "$SHAPE_IF" root netem \
-    delay "$delay" loss "$loss"
+RESULTS_DIR="./tls-baseline-results/$(date +%Y%m%d-%H%M%S)-${CHANNEL}"
+mkdir -p "$RESULTS_DIR"
+echo ">>> RESULTS_DIR = $RESULTS_DIR"
+
+echo "=== 1. Build ==="
+cargo build --release 2>&1 | tail -20
+test -x "$BIN" || { echo "binary not found at $BIN"; exit 1; }
+
+echo "=== 2. Namespaces + veth ==="
+sudo ip netns del ns-alice 2>/dev/null || true
+sudo ip netns del ns-bob   2>/dev/null || true
+sudo ip netns add ns-alice
+sudo ip netns add ns-bob
+sudo ip link add veth-a type veth peer name veth-b
+sudo ip link set veth-a netns ns-alice
+sudo ip link set veth-b netns ns-bob
+sudo ip netns exec ns-alice ip addr add 10.200.1.1/24 dev veth-a
+sudo ip netns exec ns-bob   ip addr add 10.200.1.2/24 dev veth-b
+sudo ip netns exec ns-alice ip link set veth-a up
+sudo ip netns exec ns-bob   ip link set veth-b up
+sudo ip netns exec ns-alice ip link set lo up
+sudo ip netns exec ns-bob   ip link set lo up
+sudo ip netns exec ns-alice ethtool -K veth-a tx off rx off
+sudo ip netns exec ns-bob   ethtool -K veth-b tx off rx off
+sudo ip netns exec ns-alice ping -c 2 10.200.1.2
+
+echo "=== 3. Apply channel: $CHANNEL (both ends) ==="
+sudo ./apply_channel.sh "$CHANNEL" ns-alice veth-a
+sudo ./apply_channel.sh "$CHANNEL" ns-bob   veth-b
+
+run_pass() {
+  local pass="$1"; shift            # "resume" | "noresume"
+  local extra=("$@")                # extra client flags
+  echo "--- pass: $pass (reconnects=$RECONNECTS) ---"
+  sudo pkill -9 -f "tls-baseline" 2>/dev/null || true
+  sleep 1
+
+  sudo ip netns exec ns-bob "$BIN" server --listen 10.200.1.2:4443 \
+      > "$RESULTS_DIR/server_${pass}.log" 2>&1 &
+  local srv=$!
+  sleep 1
+
+  sudo ip netns exec ns-alice "$BIN" client \
+      --server 10.200.1.2:4443 --bind 10.200.1.1:0 \
+      --channel "$CHANNEL" --rtt-ms "${RTT_TAG[$CHANNEL]}" \
+      --reconnects "$RECONNECTS" --blackout-ms "$BLACKOUT_MS" \
+      "${extra[@]}" \
+      > "$RESULTS_DIR/tls_baseline_${CHANNEL}_${pass}.jsonl" \
+      2> "$RESULTS_DIR/client_${pass}.log" || true
+
+  sudo kill "$srv" 2>/dev/null || true
+  wait "$srv" 2>/dev/null || true
+  echo "    -> $RESULTS_DIR/tls_baseline_${CHANNEL}_${pass}.jsonl"
 }
 
-clear_netem() {
-  ip netns exec "$SERVER_NS" tc qdisc del dev "$SHAPE_IF" root 2>/dev/null || true
-}
+echo "=== 4. Runs ==="
+run_pass resume
+run_pass noresume --no-resumption
 
-run_channel() {
-  local ch="$1"; read -r delay loss blackout rtt_tag <<<"${PROFILES[$ch]}"
-  echo "== $ch : delay=$delay loss=$loss blackout=${blackout}ms rtt_tag=${rtt_tag}ms =="
+echo "=== 5. Clear channel ==="
+sudo ./apply_channel.sh clear ns-alice veth-a
+sudo ./apply_channel.sh clear ns-bob   veth-b
 
-  apply_netem "$delay" "$loss"
-
-  # start server in the background inside ns-bob
-  ip netns exec "$SERVER_NS" "$BIN" server --listen "${SERVER_IP}:${SERVER_PORT}" &
-  local srv_pid=$!
-  sleep 1  # let it bind
-
-  # run client inside ns-alice, capture JSONL
-  #   --no-resumption is deliberately RUN TWICE below: once with 0-RTT allowed,
-  #   once forced full-handshake, so Ch6 can show both. Comment out the pass you
-  #   don't want.
-  ip netns exec "$CLIENT_NS" "$BIN" client \
-    --server "${SERVER_IP}:${SERVER_PORT}" \
-    --channel "$ch" --rtt-ms "$rtt_tag" \
-    --reconnects "$RECONNECTS" --blackout-ms "$blackout" \
-    > "${OUTDIR}/tls_baseline_${ch}.jsonl"
-
-  # forced full-handshake pass (ticket-expiry / long-blackout case)
-  ip netns exec "$CLIENT_NS" "$BIN" client \
-    --server "${SERVER_IP}:${SERVER_PORT}" \
-    --channel "$ch" --rtt-ms "$rtt_tag" \
-    --reconnects "$RECONNECTS" --blackout-ms "$blackout" --no-resumption \
-    > "${OUTDIR}/tls_baseline_${ch}_noresume.jsonl"
-
-  kill "$srv_pid" 2>/dev/null || true
-  wait "$srv_pid" 2>/dev/null || true
-  clear_netem
-  echo "   -> ${OUTDIR}/tls_baseline_${ch}.jsonl (+ _noresume)"
-}
-
-cargo build --release --manifest-path Cargo.toml
-
-for ch in LEO GEO Lunar Mars; do
-  run_channel "$ch"
-done
-
-echo "Done. JSONL results in ${OUTDIR}/"
+echo
+echo "=== DONE. JSONL in $RESULTS_DIR ==="
+head -n 2 "$RESULTS_DIR"/tls_baseline_"${CHANNEL}"_resume.jsonl 2>/dev/null || true

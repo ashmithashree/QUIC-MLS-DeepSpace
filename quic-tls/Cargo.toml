@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 # Baseline for the QUIC-MLS evaluation: vanilla Quinn (QUIC) + default rustls TLS 1.3.
-# Kept in the same quinn/rustls generation as the QUIC-MLS side so the two runners
+# Uses the SAME workspace-pinned quinn/rustls/rcgen as the QUIC-MLS side so both runners
 # are measured on identical transport machinery and only the handshake differs.
 
 [[bin]]
@@ -12,11 +12,13 @@ name = "tls-baseline"
 path = "src/main.rs"
 
 [dependencies]
-quinn = "0.11"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rcgen = "0.13"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+quinn            = { workspace = true }
+rustls           = { workspace = true }
+rcgen            = { workspace = true }
+rustls-pemfile   = { workspace = true }
+tokio            = { workspace = true }
+# Leaf deps not in the workspace table — declared directly, no conflict risk.
+anyhow      = "1"
+clap        = { version = "4", features = ["derive"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"

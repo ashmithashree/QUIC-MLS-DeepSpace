@@ -1,30 +1,22 @@
 //! tls-baseline: QUIC + TLS 1.3 baseline runner for the QUIC-MLS deep-space evaluation.
 //!
-//! This is the control condition against which QUIC-MLS is compared. It uses Quinn's
-//! *default* rustls TLS 1.3 session, so — unlike the MLS path — every reconnection pays
-//! a real handshake. It optionally attempts 0-RTT resumption (RFC 8446), which the
-//! `--no-resumption` flag disables to model the ticket-expiry case a long blackout forces.
+//! Control condition against which QUIC-MLS is compared. Uses Quinn's *default* rustls
+//! TLS 1.3 session, so — unlike the MLS path — every reconnection pays a real handshake.
+//! It optionally attempts 0-RTT resumption (RFC 8446); `--no-resumption` disables it to
+//! model the ticket-expiry case a long blackout forces.
 //!
-//! It measures, per connection, on the CLIENT side:
-//!   * handshake / reconnection latency (Instant-based, wall clock over the emulated link)
-//!   * on-wire bytes attributable to connection setup (udp tx/rx snapshot taken the moment
-//!     the connection is established, before any application payload is sent)
-//!   * whether the reconnection used 0-RTT or fell back to a full 1-RTT handshake
+//! Measures, per connection, on the CLIENT side:
+//!   * handshake / reconnection latency (Instant-based, over the emulated link)
+//!   * on-wire setup bytes (udp tx/rx snapshot the moment the connection is established,
+//!     before any application payload flows)
+//!   * whether a reconnection used 0-RTT or fell back to a full 1-RTT handshake
 //!
-//! Output is one JSON object per line on stdout (JSONL), tagged with the channel label and
-//! RTT hint you pass in, so security_budget.py can ingest it the same way it ingests the
-//! MLS runs. The runner does NOT set netem itself — the link profile is applied externally
-//! by your namespace/tc scripts; the runner only records what it observes and the labels
-//! you give it.
+//! Output: one JSON object per line (JSONL) on stdout, tagged with channel + rtt label,
+//! so securityBudget.py can ingest it the same way it ingests the MLS runs. Netem is
+//! applied EXTERNALLY by apply_channel.sh; the runner only records and labels.
 //!
-//! Roles (run one of each, server first):
-//!   tls-baseline server --listen 10.0.0.2:4443
-//!   tls-baseline client --server 10.0.0.2:4443 --channel Mars --rtt-ms 1560000 \
-//!                       --reconnects 16 --blackout-ms 15000
-//!
-//! Build/run on WSL2 (the sandbox has no Rust toolchain). See the three FLAG-ON-BUILD
-//! notes below for the API points most likely to need a small tweak on your exact patch
-//! versions of quinn 0.11.x / rustls 0.23.x.
+//! Mirrors echo-server's proven cert/GSO handling so it builds and transmits on the WSL2
+//! veth testbed unchanged.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,8 +25,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Endpoint, ServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
 
 const ALPN: &[u8] = b"quic-mls-baseline";
@@ -50,34 +42,33 @@ struct Cli {
 enum Role {
     /// Echo server. Start this in ns-bob before the client.
     Server {
-        /// Address to bind, e.g. 10.0.0.2:4443
+        /// Address to bind, e.g. 10.200.1.2:4443
         #[arg(long)]
         listen: SocketAddr,
     },
     /// Measurement client. Start this in ns-alice.
     Client {
-        /// Server address to connect to, e.g. 10.0.0.2:4443
+        /// Server address to connect to, e.g. 10.200.1.2:4443
         #[arg(long)]
         server: SocketAddr,
-        /// Channel label, purely for tagging output (LEO | GEO | Lunar | Mars).
+        /// Local bind address inside ns-alice, e.g. 10.200.1.1:0
+        #[arg(long, default_value = "10.200.1.1:0")]
+        bind: SocketAddr,
+        /// Channel label, tag only (leo | geo | lunar | mars).
         #[arg(long, default_value = "unspecified")]
         channel: String,
-        /// One-way or RTT hint in ms — tag only, echoed into each record so the
-        /// analysis can correlate latency with the emulated link. Use the same
-        /// convention you used for the MLS runs.
+        /// One-way delay hint in ms — tag only, echoed into each record so analysis can
+        /// correlate latency with the emulated link. Use the same convention as the MLS runs.
         #[arg(long, default_value_t = 0)]
         rtt_ms: u64,
         /// Number of reconnections to perform after the initial handshake.
         #[arg(long, default_value_t = 16)]
         reconnects: u32,
         /// Simulated offline gap between closing a connection and reconnecting (ms).
-        /// Models the blackout window; the link itself is dark via netem, this just
-        /// spaces the reconnect attempts.
         #[arg(long, default_value_t = 0)]
         blackout_ms: u64,
-        /// Disable TLS session resumption / 0-RTT, forcing a full 1-RTT handshake on
-        /// every reconnection. This is the RFC 8446 ticket-expiry case: after a long
-        /// blackout no fresh ticket survives, so resumption is impossible.
+        /// Disable TLS resumption / 0-RTT, forcing a full 1-RTT handshake on every
+        /// reconnection — the RFC 8446 ticket-expiry case after a long blackout.
         #[arg(long, default_value_t = false)]
         no_resumption: bool,
     },
@@ -102,24 +93,21 @@ struct Record {
 
 impl Record {
     fn emit(&self) {
-        // One JSON object per line; security_budget.py reads these like the MLS runs.
         println!("{}", serde_json::to_string(self).expect("serialise record"));
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // rustls 0.23 requires a crypto provider to be installed before any config builder runs.
-    // FLAG-ON-BUILD (1): if you enabled the `aws-lc-rs` feature instead of `ring`, swap this
-    // for rustls::crypto::aws_lc_rs::default_provider().
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("install default rustls crypto provider");
+    // rustls 0.23 needs a process-default crypto provider before any builder runs.
+    // aws-lc-rs is the workspace default (same one echo-server/quic-mls compile against).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     match Cli::parse().role {
         Role::Server { listen } => run_server(listen).await,
         Role::Client {
             server,
+            bind,
             channel,
             rtt_ms,
             reconnects,
@@ -128,6 +116,7 @@ async fn main() -> Result<()> {
         } => {
             run_client(
                 server,
+                bind,
                 channel,
                 rtt_ms,
                 reconnects,
@@ -139,31 +128,40 @@ async fn main() -> Result<()> {
     }
 }
 
+/// TransportConfig with GSO disabled. WSL2's veth driver falsely reports GSO support,
+/// making quinn-udp's sendmsg fail silently (zero bytes). Same fix as echo-server.
+/// (quinn issue #2399). Applied to BOTH endpoints.
+fn wsl2_safe_transport() -> Arc<TransportConfig> {
+    let mut transport = TransportConfig::default();
+    transport.enable_segmentation_offload(false);
+    Arc::new(transport)
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
 
 fn build_server_config() -> Result<ServerConfig> {
-    // Self-signed cert is fine: this is a benchmark, not a deployment. The client
-    // skips verification (see SkipServerVerification). SAN "localhost" is what the
-    // client passes as server_name on connect.
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+    // Self-signed cert (benchmark only). rcgen 0.14 API, PEM->DER via rustls-pemfile,
+    // copied from echo-server so it is known to compile in this workspace.
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
         .context("generate self-signed cert")?;
-    let cert_der: CertificateDer<'static> = cert.cert.der().clone();
-    let key_der: PrivateKeyDer<'static> =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    let cert_der: CertificateDer<'static> = ck.cert.der().clone();
+    let key_pem = ck.signing_key.serialize_pem();
+    let key_der: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .context("parse key PEM")?
+        .context("no private key found in PEM")?;
 
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
         .context("rustls server config")?;
     server_crypto.alpn_protocols = vec![ALPN.to_vec()];
-    // Enable server-side acceptance of 0-RTT early data. If this field name differs on
-    // your rustls patch, it's `max_early_data_size` on rustls::ServerConfig.
-    server_crypto.max_early_data_size = u32::MAX;
+    server_crypto.max_early_data_size = u32::MAX; // accept 0-RTT early data
 
-    let server_config =
+    let mut server_config =
         ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
+    server_config.transport = wsl2_safe_transport();
     Ok(server_config)
 }
 
@@ -189,8 +187,6 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
         Err(connecting) => connecting.await?,
     };
 
-    // Echo loop: read each bidi stream to end, write it back. This also ensures the
-    // handshake fully completes and the server issues a session ticket for resumption.
     loop {
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
@@ -212,39 +208,35 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn build_client_config(no_resumption: bool) -> Result<ClientConfig> {
-    let provider = rustls::crypto::ring::default_provider();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification(Arc::new(provider))))
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification(provider)))
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![ALPN.to_vec()];
 
     if no_resumption {
-        // Force a full 1-RTT handshake every time: no stored tickets, no early data.
-        // Models the long-blackout case where any RFC 8446 ticket has expired.
         client_crypto.resumption = rustls::client::Resumption::disabled();
         client_crypto.enable_early_data = false;
     } else {
-        // Default rustls client keeps an in-memory ticket store; enabling early data
-        // lets the second+ connections attempt 0-RTT.
         client_crypto.enable_early_data = true;
     }
 
-    Ok(ClientConfig::new(Arc::new(QuicClientConfig::try_from(
-        client_crypto,
-    )?)))
+    let mut client_config =
+        ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
+    client_config.transport_config(wsl2_safe_transport());
+    Ok(client_config)
 }
 
 async fn run_client(
     server: SocketAddr,
+    bind: SocketAddr,
     channel: String,
     rtt_ms: u64,
     reconnects: u32,
     blackout_ms: u64,
     no_resumption: bool,
 ) -> Result<()> {
-    // Bind the client endpoint to an unspecified local port on the client-side interface.
-    let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
     let mut endpoint = Endpoint::client(bind)?;
     endpoint.set_default_client_config(build_client_config(no_resumption)?);
 
@@ -265,7 +257,7 @@ async fn run_client(
         zero_rtt_accepted: false,
     }
     .emit();
-    app_ping(&conn).await?; // exchange one small message so the server issues a ticket
+    app_ping(&conn).await?; // one small exchange so the server issues a ticket
     conn.close(0u32.into(), b"initial-done");
 
     // --- Reconnections ---
@@ -299,7 +291,6 @@ async fn run_client(
     Ok(())
 }
 
-/// Full 1-RTT handshake. Returns (conn, latency_ms, tx_bytes, rx_bytes, crypto_tx, crypto_rx).
 async fn full_handshake(
     endpoint: &Endpoint,
     server: SocketAddr,
@@ -311,10 +302,6 @@ async fn full_handshake(
     Ok((conn, ms, tx, rx, ctx, crx))
 }
 
-/// Reconnection. Attempts 0-RTT when resumption is enabled; records which path was taken.
-/// FLAG-ON-BUILD (2): `Connecting::into_0rtt()` returns Err(Connecting) when 0-RTT can't be
-/// used (no ticket yet, or disabled), which we then await as a normal handshake — this is the
-/// documented quinn 0.11 shape and the fallback is expected on the first reconnect.
 async fn reconnect(
     endpoint: &Endpoint,
     server: SocketAddr,
@@ -336,18 +323,15 @@ async fn reconnect(
 
     let connecting = endpoint.connect(server, "localhost")?;
     let t0 = Instant::now();
+    // Err(Connecting) means no usable ticket yet (expected on reconnect #1) -> full handshake.
     match connecting.into_0rtt() {
         Ok((conn, accepted)) => {
-            // 0-RTT connection object is available immediately. The `accepted` future
-            // resolves to whether the server actually accepted the early data. We time
-            // to the point the connection is usable (0-RTT keys ready).
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let zrtt = accepted.await;
             let (tx, rx, ctx, crx) = setup_bytes(&conn);
             Ok((conn, ms, tx, rx, ctx, crx, "0rtt", zrtt))
         }
         Err(connecting) => {
-            // No usable ticket — full handshake fallback.
             let conn = connecting.await?;
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
             let (tx, rx, ctx, crx) = setup_bytes(&conn);
@@ -356,11 +340,8 @@ async fn reconnect(
     }
 }
 
-/// Snapshot of setup cost: bytes on the wire and CRYPTO frame counts, taken the moment the
-/// connection is established and before any app payload flows, so it attributes to setup.
-/// FLAG-ON-BUILD (3): field paths are quinn 0.11 `ConnectionStats`
-/// (udp_tx.bytes / udp_rx.bytes / frame_tx.crypto / frame_rx.crypto). If a patch renames a
-/// field, `conn.stats()` in your quinn version is the thing to check.
+/// Setup-cost snapshot: on-wire bytes and CRYPTO frame counts, taken the moment the
+/// connection is established and before any app payload flows.
 fn setup_bytes(conn: &quinn::Connection) -> (u64, u64, u64, u64) {
     let s = conn.stats();
     (
@@ -372,7 +353,7 @@ fn setup_bytes(conn: &quinn::Connection) -> (u64, u64, u64, u64) {
 }
 
 /// One tiny request/response so the connection is genuinely used and the server issues a
-/// resumption ticket. Kept out of the setup-bytes snapshot by construction (called after it).
+/// resumption ticket. Called after the setup-bytes snapshot, so it never pollutes it.
 async fn app_ping(conn: &quinn::Connection) -> Result<()> {
     let (mut send, mut recv) = conn.open_bi().await?;
     send.write_all(b"ping").await?;
@@ -385,8 +366,8 @@ async fn app_ping(conn: &quinn::Connection) -> Result<()> {
 // Cert verification skip (benchmark only)
 // ---------------------------------------------------------------------------
 
-/// Accepts any server certificate. This is safe here ONLY because it is a closed-loop
-/// benchmark on an emulated link; never use this in a real deployment.
+/// Accepts any server certificate. Safe ONLY because this is a closed-loop benchmark on an
+/// emulated link; never use in a real deployment.
 #[derive(Debug)]
 struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
