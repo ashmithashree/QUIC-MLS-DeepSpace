@@ -1,0 +1,8 @@
+[2m2026-07-28T22:17:51.451660Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m0 [3mto_epoch[0m[2m=[0m2
+[2m2026-07-28T22:21:56.481469Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m2 [3mto_epoch[0m[2m=[0m3
+[2m2026-07-28T22:29:56.583233Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m3 [3mto_epoch[0m[2m=[0m4
+[2m2026-07-28T22:30:06.572421Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m4 [3mto_epoch[0m[2m=[0m5
+[2m2026-07-28T22:34:11.591304Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m5 [3mto_epoch[0m[2m=[0m6
+[2m2026-07-28T22:42:12.669479Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m6 [3mto_epoch[0m[2m=[0m7
+[2m2026-07-28T22:42:22.659985Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m7 [3mto_epoch[0m[2m=[0m8
+[2m2026-07-28T22:42:27.591813Z[0m [33m WARN[0m [2mtestbed_runner[0m[2m:[0m cycle 3: stale connection (accept_bi timed out), abandoning and retrying

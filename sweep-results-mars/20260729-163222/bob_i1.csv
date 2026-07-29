@@ -1,0 +1,8 @@
+timestamp_ms,event,epoch,bytes,latency_ms,mode
+1785339412262,zero_rtt_available,0,0,240084.102,0rtt
+1785339412266,control_stream_0rtt,0,0,0.000,0rtt
+1785339907352,handshake_confirmed,15,0,735174.190,0rtt
+1785340147611,zero_rtt_available,0,0,240258.167,0rtt
+1785340147612,control_stream_0rtt,0,0,0.000,0rtt
+1785340627664,reconnect_handshake_confirmed,25,0,720311.293,0rtt
+1785341783007,done,0,0,0.000,0rtt

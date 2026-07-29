@@ -1,0 +1,11 @@
+[2m2026-07-28T12:59:37.605472Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m0 [3mto_epoch[0m[2m=[0m1
+[2m2026-07-28T12:59:40.612007Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m1 [3mto_epoch[0m[2m=[0m2
+[2m2026-07-28T12:59:43.620539Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m2 [3mto_epoch[0m[2m=[0m3
+[2m2026-07-28T12:59:46.629155Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m3 [3mto_epoch[0m[2m=[0m4
+[2m2026-07-28T12:59:49.637757Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m4 [3mto_epoch[0m[2m=[0m5
+[2m2026-07-28T13:03:52.666381Z[0m [33m WARN[0m [2mtestbed_runner[0m[2m:[0m quic-mls: could not apply preamble commit window: fell off the back of the commit window: gap in received epochs [3mlocal_epoch[0m[2m=[0m5
+[2m2026-07-28T13:03:52.675271Z[0m [33m WARN[0m [2mtestbed_runner[0m[2m:[0m quic-mls: could not apply preamble commit window: fell off the back of the commit window: gap in received epochs [3mlocal_epoch[0m[2m=[0m5
+[2m2026-07-28T13:18:52.696887Z[0m [33m WARN[0m [2mtestbed_runner[0m[2m:[0m cycle 2: stale connection (accept_bi timed out), abandoning and retrying
+[2m2026-07-28T13:22:52.758525Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m5 [3mto_epoch[0m[2m=[0m6
+[2m2026-07-28T13:22:52.776010Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m6 [3mto_epoch[0m[2m=[0m8
+[2m2026-07-28T13:22:52.783857Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m8 [3mto_epoch[0m[2m=[0m9

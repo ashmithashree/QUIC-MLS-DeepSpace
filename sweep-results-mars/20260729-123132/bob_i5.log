@@ -1,0 +1,4 @@
+[2m2026-07-29T13:08:11.779266Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m0 [3mto_epoch[0m[2m=[0m1
+[2m2026-07-29T13:08:16.769052Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m1 [3mto_epoch[0m[2m=[0m2
+[2m2026-07-29T13:08:21.777549Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m2 [3mto_epoch[0m[2m=[0m3
+[2m2026-07-29T13:29:33.681029Z[0m [33m WARN[0m [2mtestbed_runner[0m[2m:[0m cycle 2: stale connection (accept_bi timed out), abandoning and retrying

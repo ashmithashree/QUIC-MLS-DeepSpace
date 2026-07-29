@@ -1,0 +1,14 @@
+timestamp_ms,event,epoch,bytes,latency_ms,mode
+1785281833250,zero_rtt_available,0,0,261.813,0rtt
+1785281833250,control_stream_0rtt,0,0,0.000,0rtt
+1785281833748,handshake_confirmed,0,0,759.832,0rtt
+1785281858760,zero_rtt_available,0,0,10009.066,0rtt
+1785281858761,control_stream_0rtt,0,0,0.000,0rtt
+1785281859254,reconnect_handshake_confirmed,3,0,10503.402,0rtt
+1785281884271,zero_rtt_available,0,0,10016.363,0rtt
+1785281884272,control_stream_0rtt,0,0,0.000,0rtt
+1785281884785,reconnect_handshake_confirmed,7,0,10530.127,0rtt
+1785281909779,zero_rtt_available,0,0,10003.815,0rtt
+1785281909779,control_stream_0rtt,0,0,0.000,0rtt
+1785281910286,reconnect_handshake_confirmed,9,0,10511.239,0rtt
+1785281923231,done,0,0,0.000,0rtt

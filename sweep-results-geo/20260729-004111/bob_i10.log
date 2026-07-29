@@ -1,0 +1,11 @@
+[2m2026-07-28T23:45:53.331280Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m0 [3mto_epoch[0m[2m=[0m1
+[2m2026-07-28T23:46:03.316705Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m1 [3mto_epoch[0m[2m=[0m2
+[2m2026-07-28T23:46:18.322842Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m2 [3mto_epoch[0m[2m=[0m3
+[2m2026-07-28T23:46:18.834236Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m3 [3mto_epoch[0m[2m=[0m4
+[2m2026-07-28T23:46:28.831158Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m4 [3mto_epoch[0m[2m=[0m5
+[2m2026-07-28T23:46:43.836318Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m5 [3mto_epoch[0m[2m=[0m6
+[2m2026-07-28T23:46:44.354913Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m6 [3mto_epoch[0m[2m=[0m7
+[2m2026-07-28T23:46:54.350028Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m7 [3mto_epoch[0m[2m=[0m8
+[2m2026-07-28T23:47:09.342321Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m8 [3mto_epoch[0m[2m=[0m9
+[2m2026-07-28T23:47:09.849786Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m9 [3mto_epoch[0m[2m=[0m10
+[2m2026-07-28T23:47:19.854538Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m quic-mls: applied preamble commit window [3mfrom_epoch[0m[2m=[0m10 [3mto_epoch[0m[2m=[0m11

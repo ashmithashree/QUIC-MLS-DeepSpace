@@ -1,0 +1,11 @@
+[2m2026-07-29T13:44:36.302600Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m0 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T13:44:36.368197Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m1 [3melapsed_ms[0m[2m=[0m63
+[2m2026-07-29T13:53:01.430568Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m1 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T13:53:01.430834Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m2 [3melapsed_ms[0m[2m=[0m0
+[2m2026-07-29T14:01:26.506047Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m2 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T14:01:26.506245Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m3 [3melapsed_ms[0m[2m=[0m0
+[2m2026-07-29T14:10:02.531421Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m3 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T14:10:02.531574Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m4 [3melapsed_ms[0m[2m=[0m0
+[2m2026-07-29T14:18:27.657397Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m4 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T14:18:27.657562Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m5 [3melapsed_ms[0m[2m=[0m0
+[2m2026-07-29T14:35:32.909519Z[0m [33m WARN[0m [2mtestbed_runner[0m[2m:[0m reconnect attempt timed out after report_timeout, retrying next contact window [3mcycle[0m[2m=[0m5 [3melapsed_ms[0m[2m=[0m900003

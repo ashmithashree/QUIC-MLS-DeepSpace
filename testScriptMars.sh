@@ -54,7 +54,7 @@ REPORT_TIMEOUT=900
 # reconnect round trip (480s+, more under 1% loss retransmission). 3600s
 # gives comfortable margin for one full cycle including a retry, on both
 # Bob's and Alice's side (they share this value).
-DURATION=3600
+DURATION=2100
 
 TRANSCRIPT_MAX_BYTES=20000
 

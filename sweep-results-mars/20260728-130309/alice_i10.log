@@ -1,0 +1,8 @@
+[2m2026-07-28T14:48:15.466568Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m0 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-28T14:48:15.487967Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m1 [3melapsed_ms[0m[2m=[0m21
+[2m2026-07-28T14:56:40.536239Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m1 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-28T15:00:30.541223Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m2 [3melapsed_ms[0m[2m=[0m230004
+[2m2026-07-28T15:08:55.615801Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m2 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-28T15:12:45.628539Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m3 [3melapsed_ms[0m[2m=[0m230012
+[2m2026-07-28T15:21:10.727086Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m3 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-28T15:36:10.735728Z[0m [33m WARN[0m [2mtestbed_runner[0m[2m:[0m wait_for_ready timed out -- proceeding with stale cycle value, peer's connection-close notification may still be in flight or lost [3mafter[0m[2m=[0m3 [3melapsed_ms[0m[2m=[0m900008
