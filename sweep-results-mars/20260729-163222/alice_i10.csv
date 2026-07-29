@@ -21,3 +21,5 @@ timestamp_ms,event,epoch,bytes,latency_ms,mode
 1785348041128,handshake_transcript_embedded,6,3081,3.128,0rtt
 1785348941155,reconnect_attempt_timed_out,6,0,900029.425,0rtt
 1785349056748,handshake_transcript_embedded,6,3081,0.749,0rtt
+1785350384715,reconnect_attempt_timed_out,6,0,900042.875,0rtt
+1785350384732,done,6,0,0.000,0rtt

@@ -1,5 +1,0 @@
-interval_s	missed_commits_est	embedded_bytes	transcript_truncated	reconnect_epoch_matched	recovery_flush_bytes	verdict
-1	15	50	no	yes	NONE	LIVELOCK-SUSPECT
-3	5	18	no	yes	NONE	LIVELOCK-SUSPECT
-5	3	5	no	no	NONE	LIVELOCK-SUSPECT
-10	1	12	no	yes	NONE	LIVELOCK-SUSPECT
