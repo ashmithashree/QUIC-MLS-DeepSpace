@@ -1,8 +1,12 @@
-// Reference 
-// RFC 9001 - from https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity
-//RFC 8446 - from https://www.rfc-editor.org/rfc/rfc8446.html#name-hkdf-expand-label
-
-
+//Note:
+// HKDF-Expand-Label, reused from TLS 1.3's key schedule as QUIC's own
+// HKDF labelling convention.
+// References:
+//   RFC 8446 section 7.1 (HKDF-Expand-Label), IETF, Rescorla, 2018.
+//     https://www.rfc-editor.org/rfc/rfc8446.html#name-hkdf-expand-label
+//   RFC 9001 section 5.2 (Initial Secrets, salt constant), IETF, Thomson & Turner, 2021.
+//     https://www.rfc-editor.org/rfc/rfc9001.html#name-initial-secrets
+//======================================================================================================================
 use hkdf::Hkdf;
 use sha2::Sha256;
 

@@ -1,3 +1,22 @@
+// Note
+// Empirical measurement harness: runs Alice/Bob over Linux network-namespace
+// + tc netem emulated channels, driving the connect/commit/blackout/
+// reconnect cycle and logging per-event CSV telemetry that
+// securityBudget.py later reduces to SSOR/RC/SB.
+// References:
+//   RFC 9287 (QUIC bit greasing — grease_quic_bit(false) requirement,
+//   verified above endpoint_config_without_quic_bit_greasing), IETF,
+//   Thomson, 2022.
+//     https://www.rfc-editor.org/rfc/rfc9287.html
+//   RFC 9000 section 17.2 / section 17.3.1 (fixed-bit invariant the marker depends on).
+//     https://www.rfc-editor.org/rfc/rfc9000.html
+//   Linux tc-netem(8) — network emulation used to construct the LEO/GEO/
+//   Lunar/Mars channel profiles this harness runs against.
+//     https://man7.org/linux/man-pages/man8/tc-netem.8.html
+//   Emulation methodology follows: Kosek et al., "Exploring the QUIC and
+//   TCP Interplay for Satellite Networks"
+//   Channel parameter provenance: Blanchet, "Deep Space QUIC Profile"
+//======================================================================================================================
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -22,13 +41,7 @@ use tokio::io::AsyncWriteExt;
 
 const CS: CipherSuite = CipherSuite::CURVE25519_AES128;
 
-// The paper's tunable transcript length `tl`: a total-byte budget across all
-// preamble datagrams for one arm()/`send_preamble` call (still truncates to
-// the earliest contiguous prefix of the backlog if set low, for research
-// use). Unlike the old transport-parameter mechanism this replaced, there is
-// no single-packet ceiling to size a small default around -- datagrams are
-// chunked to fit the network MTU regardless of how large the backlog is --
-// so the default is effectively unbounded.
+
 const DEFAULT_TRANSCRIPT_MAX_BYTES: usize = usize::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,15 +151,7 @@ fn transport_config(idle: Duration) -> Arc<TransportConfig> {
     Arc::new(cfg)
 }
 
-// `EndpointConfig::default()` has `grease_quic_bit: true` (RFC 9287): quinn-proto
-// will then randomly clear the fixed bit (0x40) on outgoing packets to prevent
-// implementations from ossifying on it always being set. That's exactly the bit
-// PreambleSocket's marker check depends on to prove a datagram is real QUIC
-// traffic (RFC 9000 S17.2/17.3.1 -- absent greasing, quinn-proto never clears
-// both the header-form bit and the fixed bit together). Confirmed empirically:
-// with greasing left on, real 1-RTT short-header packets were intermittently
-// intercepted and dropped by the preamble layer instead of reaching quinn.
-// Must be disabled on both endpoints for the discriminator to hold.
+
 fn endpoint_config_without_quic_bit_greasing() -> EndpointConfig {
     let mut cfg = EndpointConfig::default();
     cfg.grease_quic_bit(false);
@@ -272,19 +277,9 @@ async fn bootstrap_alice(dir: &Path) -> impl quic_mls::ExportSecret + 'static {
 async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let bob_group = bootstrap_bob(&args.bootstrap_dir).await;
     let bob_group = Arc::new(Mutex::new(bob_group));
-    // Applied by the preamble socket's sink below as soon as a preamble
-    // datagram decodes, independent of and not synchronized with
-    // MlsSession::read_handshake/write_handshake -- see the race-condition
-    // note in the plan this was built from. The sink is now the *only*
-    // writer of this counter: the commit window arrives exclusively as a
-    // preamble datagram in both scenarios (steady state and post-blackout
-    // reconnect), so there is no second, stream-based path racing it anymore.
+
     let local_epoch = Arc::new(Mutex::new(0u64));
-    // Fed by the preamble sink below, drained by run_report_sender: the only
-    // remaining signal that used to be "a CommitWindow arrived over the
-    // control stream" now that the commit window travels exclusively as a
-    // preamble datagram in both scenarios (see PreambleSocket::send_preamble
-    // call sites in run_alice). Report stays on the control stream.
+
     let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
 
     let mode = "0rtt";
@@ -295,9 +290,7 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut cycle: u64 = 0;
     let idle = args.report_timeout + args.commit_interval + Duration::from_secs(30);
 
-    // MlsServerConfig is single-use (start_session takes ownership of the group
-    // once), so a fresh one is required for every connection -- but the Endpoint
-    // itself (and its bound UDP socket) is reused across reconnects.
+
     let make_server_config = |idle: Duration| {
         let mut cfg = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
             Box::new(Arc::clone(&bob_group)),
@@ -307,25 +300,7 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         cfg
     };
 
-    // Decodes and applies a preamble datagram's commit window directly
-    // against `bob_group`, independent of the QUIC handshake in flight on
-    // the same socket. `apply_commit_window`'s existing `epoch <=
-    // local_epoch` skip is what makes this safe against replay: nothing at
-    // this layer binds a preamble to a connection ID or packet number, so a
-    // captured preamble could be replayed by anyone who can reach this port,
-    // at any time -- idempotency is the only thing preventing that from
-    // being reapplied or causing confusion (see PreambleSocket's docs).
-    //
-    // This sink runs synchronously inside PreambleSocket::poll_recv, which
-    // the endpoint driver calls for the whole lifetime of the socket. The
-    // AB-BA hazard this lock order (group, then local_epoch) originally
-    // guarded against -- a second task acquiring the same two mutexes in the
-    // opposite order -- no longer exists by construction: run_report_sender
-    // (spawned per-connection below) never locks `bob_group` or
-    // `local_epoch` at all, it only reads `epoch_rx` and writes to the
-    // control stream. This sink is the sole acquirer of both locks now, so
-    // the order is kept for clarity/future-proofing rather than because
-    // anything else contends for it today.
+   
     let sink: CommitSink = {
         let bob_group = Arc::clone(&bob_group);
         let local_epoch = Arc::clone(&local_epoch);
@@ -353,9 +328,7 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (*epoch, *epoch != before)
             };
-            // Notify run_report_sender outside the group/local_epoch locks --
-            // must match the lock order documented above, and send_replace
-            // never blocks on a listener anyway.
+
             if changed {
                 epoch_tx.send_replace(new_epoch);
             }
@@ -398,20 +371,14 @@ async fn run_bob(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let is_0rtt = recv.is_0rtt();
-        // Nothing meaningful arrives from Alice on this stream anymore --
-        // the commit window travels as a preamble datagram now, and Hello
-        // was only ever used for the is_0rtt check above -- so the receive
-        // half is intentionally left unread rather than spawning a reader
-        // for it.
+
         drop(recv);
 
         out.row("zero_rtt_available", 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
         out.row(if is_0rtt { "control_stream_0rtt" } else { "control_stream_1rtt" }, 0, 0, 0.0).await?;
         zero_rtt_accepted.await;
         let event = if cycle == 1 { "handshake_confirmed" } else { "reconnect_handshake_confirmed" };
-        // local_epoch reflects whatever the preamble sink has applied so far --
-        // independent of and not synchronized with this handshake, per the
-        // race-condition note on the sink above.
+
         let epoch_now = *local_epoch.lock().unwrap();
         out.row(event, epoch_now, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
 
@@ -459,11 +426,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         cfg
     };
 
-    // Alice never receives a preamble in this testbed (Bob never originates
-    // commits), so `sink = None` -- see PreambleSocket::new's docs. Kept as
-    // a concrete handle (not just the `Arc<dyn AsyncUdpSocket>` handed to
-    // quinn below) so `send_preamble` can be called on it directly from the
-    // reconnect loop.
+
     let alice_socket = tokio::net::UdpSocket::bind(args.bind_addr).await?;
     let preamble_socket = Arc::new(PreambleSocket::new(alice_socket, None));
     let endpoint = Endpoint::new_with_abstract_socket(
@@ -494,15 +457,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             out.row(event, 0, 0, t0.elapsed().as_secs_f64() * 1000.0).await?;
             (conn, send, recv)
         } else {
-            // The commit transcript travels as one or more plaintext UDP
-            // datagrams sent directly over the same socket quinn will use
-            // for the QUIC connection, immediately before attempting the
-            // reconnect -- not embedded in the handshake itself (see
-            // PreambleSocket::send_preamble). A single best-effort
-            // fire-and-forget send: never awaited under `report_timeout`,
-            // since a dropped preamble datagram is simply retried (with an
-            // equal-or-larger window) on the next contact window, per
-            // invariant 1.
+   
             let window = alice_group.lock().unwrap().window_bytes();
             let t_preamble = Instant::now();
             let embedded_bytes = preamble_socket
@@ -529,11 +484,6 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             })
             .await;
 
-            // Alice never blocks waiting on Bob to catch up (invariant 1):
-            // a failed cycle just moves on to the next contact window. Her
-            // commit log is untouched (checkpoint/trim only ever advance via
-            // a Report picked up opportunistically by run_report_receiver),
-            // so the next attempt offers an equal-or-larger window.
             let (conn, send, recv, ok) = match connect_result {
                 Ok(Ok(v)) => v,
                 Err(_) => {
@@ -558,11 +508,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             (conn, send, recv)
         };
 
-        // Report is purely optional and asynchronous now, in both scenarios:
-        // picked up opportunistically off the control stream whenever Bob
-        // happens to send one, and used only to trim the commit log -- never
-        // awaited before Alice's next action (next commit, force_key_update,
-        // next reconnect attempt).
+
         let report_task = tokio::spawn(run_report_receiver(Arc::clone(&alice_group), recv));
 
         let phase_start = Instant::now();
@@ -590,9 +536,7 @@ async fn run_alice(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let cpu_ms = t1.elapsed().as_secs_f64() * 1000.0;
             epoch += 1;
             let t2 = Instant::now();
-            // Unified with the reconnect case: the current window is always
-            // sent as a fire-and-forget preamble datagram, never awaited --
-            // see the reconnect branch above for the identical call.
+
             let window = alice_group.lock().unwrap().window_bytes();
             let bytes_sent = preamble_socket
                 .send_preamble(peer_addr, &window, args.transcript_max_bytes)

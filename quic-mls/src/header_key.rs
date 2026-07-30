@@ -1,3 +1,12 @@
+//Note:
+// AES-128-GCM packet protection and AES-ECB header protection, structured
+// to satisfy quinn-proto's PacketKey / HeaderKey traits.
+// References:
+//   RFC 9001 section 5.3 (AEAD Usage) and section 5.4 (Header Protection), IETF, 2021.
+//     https://www.rfc-editor.org/rfc/rfc9001.html
+//   quinn-proto crate docs, crypto::{PacketKey, HeaderKey} traits.
+//     https://docs.rs/quinn-proto/latest/quinn_proto/crypto/
+//======================================================================================================================
 use quinn_proto::crypto::HeaderKey;
 
 pub(crate) struct Aes128EcbHeaderKey {
@@ -76,7 +85,7 @@ mod tests {
 
         let header_key = Aes128EcbHeaderKey { key: hp_key };
 
-        // 16-byte sample taken from the known-good encrypted packet, at
+        // 16-byte sample taken from the known good encrypted packet, at
         // pn_offset+4 (pn_offset=18 in that packet).
         let sample: [u8; 16] = [
             0x07, 0xb8, 0x41, 0x91, 0xa1, 0x96, 0xf7, 0x60,

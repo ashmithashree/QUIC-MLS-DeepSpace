@@ -1,3 +1,9 @@
+//Note:
+// quinn_proto::crypto::{ClientConfig, ServerConfig} implementations that
+// hand off session construction to MlsSession.
+// Reference: quinn-proto crate docs, crypto::{ClientConfig, ServerConfig}.
+//   https://docs.rs/quinn-proto/latest/quinn_proto/crypto/
+//======================================================================================================================
 use std::sync::{Arc, Mutex};
 use quinn_proto::{ConnectError, crypto::UnsupportedVersion};
 use crate::keys::{derive_initial_keys};

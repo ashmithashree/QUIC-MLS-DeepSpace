@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-
+# Note
+# Reduces per-event CSV telemetry (produced by testbed-runner/src/main.rs)
+# into the dissertation's own Security Budget metric:
+#   SB = SSOR + RC x f_blackout
+# where SSOR (steady-state overhead rate) sums commit_cpu + commit_net
+# latency over steady-state commits / run duration, RC (recovery cost) is
+# the mean reconnect_handshake_0rtt_accepted latency across blackout
+# cycles, and f_blackout is observed blackout_start count / run duration.
+#
+# This metric and its definition are original to this dissertation
+# (Section 5.1) not adapted from an external source. It deliberately
+# supersedes an earlier draft formula that used estimated propagation-delay
+# constants (SB = crypto_cycles x cycle_cost_ms + security_bytes x OWD_ms x
+# blackout_freq); the current version uses only measured latency, since
+# commit_net's timing already reflects RTT-weighted network cost
+# empirically via the tc netem emulation, without a separate analytical
+# OWD term.
+#
+# A failed recovery (blackout observed, zero successful reconnects) is
+# deliberately left undefined/excluded from a cell's SB average rather
+# than counted as zero-cost see the n_failed_recovery warning logic
+# below, and Section 5.1's discussion of this choice.
+#======================================================================================================================
 from __future__ import annotations
 
 import csv
@@ -73,10 +95,7 @@ def compute_run(alice_csv: str, channel: str, interval: int) -> RunMetrics:
     t_end = rows[-1]["timestamp_ms"]
     total_duration_s = max((t_end - t_start) / 1000.0, 1e-9)
 
-    # Steady-state commits: commit_cpu / commit_net rows that are NOT
-    # inside a blackout window (commit_offline rows mark the offline
-    # equivalent and are excluded here, since offline commits pay no
-    # network cost by construction -- there is nobody to send them to).
+
     cpu_costs = [r["latency_ms"] for r in rows if r["event"] == "commit_cpu"]
     net_costs = [r["latency_ms"] for r in rows if r["event"] == "commit_net"]
     net_bytes = [r["bytes"] for r in rows if r["event"] == "commit_net"]
@@ -113,12 +132,8 @@ def compute_run(alice_csv: str, channel: str, interval: int) -> RunMetrics:
         if m.rc_ms is not None:
             m.sb = m.ssor_ms_per_s + m.rc_ms * m.f_blackout_per_s
         elif n_blackouts == 0:
-            # No blackouts happened in this run at all -- SB is just the
-            # steady-state term, which is a legitimate (if less
-            # interesting) data point, not a failure.
+
             m.sb = m.ssor_ms_per_s
-        # else: recoveries failed: SB left as None deliberately, so a
-        # failed run cannot silently average in as if recovery were free.
 
     return m
 
@@ -219,7 +234,7 @@ def main() -> None:
         print()
         print("WARNING: at least one (channel, interval) had blackouts with zero")
         print("successful recoveries. Those runs are EXCLUDED from the SB average")
-        print("for that cell, not treated as SB=0 or dropped silently -- check")
+        print("for that cell, not treated as SB=0 or dropped silently check")
         print("n_failed_recovery in the summary before reporting SB for that cell.")
 
 

@@ -1,0 +1,9 @@
+[2m2026-07-29T22:19:32.171749Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m0 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T22:19:32.214691Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m1 [3melapsed_ms[0m[2m=[0m42
+[2m2026-07-29T22:28:08.710754Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m1 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T22:31:58.730466Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m2 [3melapsed_ms[0m[2m=[0m230017
+[2m2026-07-29T22:40:23.857220Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m2 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T22:44:13.871310Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m peer ready-cycle observed [3mcycle[0m[2m=[0m3 [3melapsed_ms[0m[2m=[0m230013
+[2m2026-07-29T22:52:39.080951Z[0m [32m INFO[0m [2mtestbed_runner[0m[2m:[0m waiting for peer ready-cycle file [3mafter[0m[2m=[0m3 [3mtimeout[0m[2m=[0m900s
+[2m2026-07-29T23:07:39.098296Z[0m [33m WARN[0m [2mtestbed_runner[0m[2m:[0m wait_for_ready timed out -- proceeding with stale cycle value, peer's connection-close notification may still be in flight or lost [3mafter[0m[2m=[0m3 [3melapsed_ms[0m[2m=[0m900015
+Error: Os { code: 101, kind: NetworkUnreachable, message: "Network is unreachable" }

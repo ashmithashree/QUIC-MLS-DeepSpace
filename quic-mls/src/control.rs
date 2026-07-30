@@ -1,4 +1,12 @@
-
+//Note:
+// Minimal application-level control-message framing for commit propagation
+// over a quinn SendStream/RecvStream, deliberately outside MLS's own scope.
+// Reference: RFC 9420 section 1 / Delivery Service note — MLS explicitly scopes
+//   message delivery/ordering out of the protocol, leaving it to the
+//   application (justification for this file's existence and its
+//   decoupling from session.rs).
+//   https://www.rfc-editor.org/rfc/rfc9420.html
+//======================================================================================================================
 pub enum ControlMessage{
     Report(u64),
     Hello,
@@ -45,15 +53,7 @@ use crate::group::{CommitLog, ExportSecret};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Alice's side of the unified recovery mechanism: the commit window itself
-/// travels exclusively as a [`crate::preamble::PreambleSocket::send_preamble`]
-/// datagram now (steady state and post-blackout reconnect alike -- see
-/// preamble.rs and the testbed-runner call sites), so the only thing left on
-/// the control stream in this direction is `Report`. This task never gates
-/// anything: it just applies whatever `Report` arrives, whenever it arrives,
-/// bounding how much of the commit log stays un-trimmed. `trim`'s own
-/// `max`/`min` clamps (group.rs) are what make an out-of-order or duplicate
-/// `Report` harmless here.
+
 pub async fn run_report_receiver<G: ExportSecret + 'static>(
     commit_log: Arc<Mutex<CommitLog<G>>>,
     mut ctrl_recv: quinn::RecvStream,
@@ -69,13 +69,7 @@ pub async fn run_report_receiver<G: ExportSecret + 'static>(
     }
 }
 
-/// Bob's side: reactively reports `local_epoch` back to Alice over the
-/// control stream whenever it changes (driven by the preamble sink applying
-/// a commit window -- see run_bob's `epoch_tx`), instead of replying to a
-/// `CommitWindow` that no longer arrives on this stream. Reports the current
-/// epoch once on start, then again on every subsequent change; never blocks
-/// on Alice reading it, and a lost/ignored `Report` costs nothing beyond a
-/// larger window on Alice's next round.
+
 pub async fn run_report_sender(
     mut ctrl_send: quinn::SendStream,
     mut epoch_rx: tokio::sync::watch::Receiver<u64>,

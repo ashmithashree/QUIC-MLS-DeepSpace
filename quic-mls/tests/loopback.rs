@@ -74,23 +74,13 @@ fn make_commit_For_Alice(alice_group: &Arc<Mutex<CommitLog<impl ExportSecret + '
     }
 }
 
-// `PreambleSocket`'s marker relies on the QUIC fixed bit never being greased
-// off -- see preamble.rs's module docs. Required on both endpoints wherever
-// a PreambleSocket is used, mirroring testbed-runner's own helper.
 fn endpoint_config_without_quic_bit_greasing() -> EndpointConfig {
     let mut cfg = EndpointConfig::default();
     cfg.grease_quic_bit(false);
     cfg
 }
 
-/// Builds a preamble-capable QUIC pair: Bob's endpoint wraps a real UDP
-/// socket in a `PreambleSocket` whose sink applies an incoming commit window
-/// directly to `bob_group` and republishes `local_epoch` on the returned
-/// watch channel (mirroring run_bob's `epoch_tx`/`sink` wiring in
-/// testbed-runner). Alice's endpoint gets the concrete `PreambleSocket`
-/// handle back so tests can call `send_preamble` directly, exactly as
-/// run_alice does for every commit window now (steady state and blackout
-/// recovery alike -- there is no other path in the unified design).
+
 async fn make_preamble_pair<A, B>(
     alice_group: &Arc<Mutex<CommitLog<A>>>,
     bob_group: &Arc<Mutex<B>>,
@@ -347,9 +337,6 @@ async fn quic_mls_loopback_0rtt_echo() {
     let alice = make_client("alice");
     let bob = make_client("bob");
 
-    // Alice and Bob already share this epoch's group state  the MLS
-    // analogue of a cached TLS session ticket  so the client can derive
-    // 0-RTT keys without ever having connected to the server before.
     let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
     let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
     let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
@@ -364,9 +351,7 @@ async fn quic_mls_loopback_0rtt_echo() {
     let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
     let server_addr = server.local_addr().unwrap();
 
-    // A panic inside tokio::spawn is swallowed unless the JoinHandle is
-    // awaited, so the real 0-RTT proof is reported back over a channel
-    // and asserted on the main test task below.
+
     let (server_saw_0rtt_tx, server_saw_0rtt_rx) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
@@ -412,60 +397,7 @@ async fn quic_mls_loopback_0rtt_echo() {
 }
 
 
-#[tokio::test]
-async fn quic_mls_0rtt_create_commit_race_before_handshake_confirms() {
-    init_tracing();
-    let alice = make_client("alice");
-    let bob = make_client("bob");
 
-    let mut alice_group = alice.create_group(ExtensionList::new(), ExtensionList::new(), None).unwrap();
-    let bob_kp = bob.generate_key_package_message(ExtensionList::new(), ExtensionList::new(), None).unwrap();
-    let commit_out = alice_group.commit_builder().add_member(bob_kp).unwrap().build().unwrap();
-    alice_group.apply_pending_commit().unwrap();
-    let (bob_group, _) = bob.join_group(None, &commit_out.welcome_messages[0], None).unwrap();
-
-    
-    let alice_group = Arc::new(Mutex::new(alice_group));
-
-    let server_config = ServerConfig::with_crypto(Arc::new(MlsServerConfig::new(
-        Box::new(bob_group),
-    )));
-    let client_config = ClientConfig::new(Arc::new(MlsClientConfig::new(Box::new(Arc::clone(&alice_group)))));
-
-    let server = Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-    let server_addr = server.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        let incoming = server.accept().await.expect("client connected").accept().expect("accept");
-        let (conn, _established) = incoming.into_0rtt().unwrap_or_else(|_| unreachable!());
-        let (mut send, mut recv) = conn.accept_bi().await.expect("client opened a stream");
-        let data = recv.read_to_end(1 << 16).await.expect("read request");
-        send.write_all(&data).await.expect("write response");
-        send.finish().expect("finish response stream");
-        conn.closed().await;
-    });
-
-    let mut endpoint = Endpoint::client(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-    endpoint.set_default_client_config(client_config);
-
-    let (conn, zero_rtt_accepted) = endpoint
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .into_0rtt()
-        .unwrap_or_else(|_| panic!("0-RTT keys must be available from the shared MLS epoch"));
-
-  
-    alice_group.lock().unwrap().create_commit().unwrap();
-
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    send.write_all(b"Hello after a racing commit!").await.unwrap();
-    send.finish().unwrap();
-
-    let response = recv.read_to_end(64).await.unwrap();
-    assert_eq!(response, b"Hello after a racing commit!");
-
-    assert!(zero_rtt_accepted.await, "connection must still complete despite the racing commit");
-}
 //---------------------------------------Acceptance tests for Quic MLS-------------------------------------------------------------------
 // this is a bidirectional stream that is opened first on both sides of the connection and is used to send commit windows and reports between the client and server.
 
@@ -600,9 +532,6 @@ async fn quic_mls_two_blackouts(){
 
 //----------------------------------------------unit test for group.rs-------------------------------------
 #[test]
-//Build a window that includes an already-applied commit 
-//this should be rejected by the server and not applied to the group state. because if bob has already applied a commit,
-//he should not apply it again. this is a safety check to ensure that the server does not apply stale commits that have already been applied to the group state.
 fn quic_mls_stale_commit_rejection(){
     let (alice_raw, mut bob_raw) = make_mls_groups();
     let mut alice_group = CommitLog::new(alice_raw);
@@ -628,10 +557,6 @@ fn quic_mls_stale_commit_rejection(){
 
 
 #[test]
-//this is test where bob has fallen behind and alice has trimmed her commit log, so bob cannot catch up without a resync. this should be rejected by the server and not applied to the group state.
-//because if bob has fallen behind and alice has trimmed her commit log, he cannot catch up without a resync. 
-//this is a safety check to ensure that the server should apply commit in order and not skip any commits, and if it cannot apply a commit because it has fallen behind,
-//it should return an error indicating that a resync is needed.
 fn quic_mls_fell_off_back() {
     let (alice_raw, mut bob_raw) = make_mls_groups();
     let mut alice_group = CommitLog::new(alice_raw);

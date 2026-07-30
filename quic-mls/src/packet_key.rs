@@ -1,3 +1,12 @@
+//Note:
+// AES-128-GCM packet protection and AES-ECB header protection, structured
+// to satisfy quinn-proto's PacketKey / HeaderKey traits.
+// References:
+//   RFC 9001 section 5.3 (AEAD Usage) and section 5.4 (Header Protection), IETF, 2021.
+//     https://www.rfc-editor.org/rfc/rfc9001.html
+//   quinn-proto crate docs, crypto::{PacketKey, HeaderKey} traits.
+//     https://docs.rs/quinn-proto/latest/quinn_proto/crypto/
+//======================================================================================================================
 use aes_gcm::{aead::AeadInPlace, Aes128Gcm, Key, KeyInit, Nonce, Tag};
 use bytes::BytesMut;
 use quinn_proto::crypto::{CryptoError, PacketKey};
