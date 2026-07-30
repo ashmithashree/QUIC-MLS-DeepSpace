@@ -1,0 +1,1 @@
+{"role":"client","phase":"initial_handshake","channel":"mars","rtt_ms":240000,"iteration":0,"handshake_ms":650163.567582,"setup_tx_bytes":27726,"setup_rx_bytes":5260,"crypto_frames_tx":20,"crypto_frames_rx":4,"mode":"full-1rtt","zero_rtt_accepted":false}
