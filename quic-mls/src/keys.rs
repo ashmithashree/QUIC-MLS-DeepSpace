@@ -1,4 +1,9 @@
+//Note:
+// Initial secret derivation and directional key derivation for QUIC's
+// Initial packet-protection level.
+// Reference: RFC 9001 section 5.2 (Initial Secrets), IETF, Thomson & Turner, 2021.
 // Reference vector from https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity
+//======================================================================================================================
 use crate::group::ExportSecret;
 use crate::header_key::Aes128EcbHeaderKey;
 use crate::hkdf::{hkdf_expand_label, hkdf_label_info, INITIAL_SALT};

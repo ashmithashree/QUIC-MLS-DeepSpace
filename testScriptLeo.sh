@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sweeps commit interval over {1,3,5,10}s under a fixed blackout window, on
 # the LEO channel, to check the transcript mechanism's behaviour as the
-# number of missed commits per blackout grows -- the same variable the base
+# number of missed commits per blackout grows the same variable the base
 # paper varies in Table 2 (missed commit count), but here under real
 # tc netem emulation with the actual reconnect handshake, not an isolated
 # single-machine benchmark.
@@ -17,14 +17,7 @@ BLACKOUT_ON=15
 BLACKOUT_OFF=10
 DURATION=90
 REPORT_TIMEOUT=8
-# Raised from the old 900: under the datagram mechanism this is send_preamble's
-# cumulative total_budget across as-many-datagrams-as-needed, not a single
-# handshake-packet ceiling -- 900 was right for stress-testing the OLD
-# transport-parameter mechanism's known limit, but left at 900 here it would
-# just truncate the transcript to ~1 commit and produce a false
-# "still livelocked" result, regardless of whether the lock-order fix worked.
-# 20000 comfortably covers a 10-commit backlog (~5,180B at 518B/commit) with
-# margin for the largest interval=1 case.
+
 TRANSCRIPT_MAX_BYTES=20000
 
 echo "=== 0. Sanity check the datagram preamble mechanism is present ==="
@@ -83,7 +76,7 @@ for INTERVAL in "${COMMIT_INTERVALS[@]}"; do
     sudo pkill -9 -f "testbed-runner" 2>/dev/null || true
     sleep 1
 
-    # Hard ceiling on this iteration -- generous margin over duration so a
+    # Hard ceiling on this iteration generous margin over duration so a
     # normal run never trips it, but nothing can silently hang undetected.
     HARD_TIMEOUT=$(( DURATION + BLACKOUT_ON + BLACKOUT_OFF + REPORT_TIMEOUT + 60 ))
 

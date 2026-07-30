@@ -1,23 +1,3 @@
-//! tls-baseline: QUIC + TLS 1.3 baseline runner for the QUIC-MLS deep-space evaluation.
-//!
-//! Control condition against which QUIC-MLS is compared. Uses Quinn's *default* rustls
-//! TLS 1.3 session, so — unlike the MLS path — every reconnection pays a real handshake.
-//! It optionally attempts 0-RTT resumption (RFC 8446); `--no-resumption` disables it to
-//! model the ticket-expiry case a long blackout forces.
-//!
-//! Measures, per connection, on the CLIENT side:
-//!   * handshake / reconnection latency (Instant-based, over the emulated link)
-//!   * on-wire setup bytes (udp tx/rx snapshot the moment the connection is established,
-//!     before any application payload flows)
-//!   * whether a reconnection used 0-RTT or fell back to a full 1-RTT handshake
-//!
-//! Output: one JSON object per line (JSONL) on stdout, tagged with channel + rtt label,
-//! so securityBudget.py can ingest it the same way it ingests the MLS runs. Netem is
-//! applied EXTERNALLY by apply_channel.sh; the runner only records and labels.
-//!
-//! Mirrors echo-server's proven cert/GSO handling so it builds and transmits on the WSL2
-//! veth testbed unchanged.
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -78,7 +58,7 @@ enum Role {
 #[derive(Serialize)]
 struct Record {
     role: &'static str,
-    phase: &'static str, // "initial_handshake" | "reconnect"
+    phase: &'static str, // "initial_handshake" / "reconnect"
     channel: String,
     rtt_ms: u64,
     iteration: u32, // 0 for the initial handshake
@@ -87,7 +67,7 @@ struct Record {
     setup_rx_bytes: u64,
     crypto_frames_tx: u64,
     crypto_frames_rx: u64,
-    mode: &'static str, // "full-1rtt" | "0rtt"
+    mode: &'static str, // "full-1rtt" / "0rtt"
     zero_rtt_accepted: bool,
 }
 
@@ -99,8 +79,6 @@ impl Record {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // rustls 0.23 needs a process-default crypto provider before any builder runs.
-    // aws-lc-rs is the workspace default (same one echo-server/quic-mls compile against).
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     match Cli::parse().role {
@@ -240,7 +218,7 @@ async fn run_client(
     let mut endpoint = Endpoint::client(bind)?;
     endpoint.set_default_client_config(build_client_config(no_resumption)?);
 
-    // --- Initial handshake (always full 1-RTT: no ticket exists yet) ---
+    // Initial handshake (always full 1-RTT: no ticket exists yet) 
     let (conn, ms, tx, rx, ctx, crx) = full_handshake(&endpoint, server).await?;
     Record {
         role: "client",
@@ -362,12 +340,7 @@ async fn app_ping(conn: &quinn::Connection) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Cert verification skip (benchmark only)
-// ---------------------------------------------------------------------------
 
-/// Accepts any server certificate. Safe ONLY because this is a closed-loop benchmark on an
-/// emulated link; never use in a real deployment.
 #[derive(Debug)]
 struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 

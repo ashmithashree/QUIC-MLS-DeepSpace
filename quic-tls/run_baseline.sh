@@ -1,17 +1,4 @@
-#!/usr/bin/env bash
-# run_tls_baseline.sh — QUIC + TLS 1.3 baseline across an emulated channel.
-#
-# Built on the SAME testbed scaffolding as testScriptLeo.sh:
-#   ns-alice (10.200.1.1) <-- veth --> ns-bob (10.200.1.2)
-#   channel shaped by apply_channel.sh on BOTH veth ends (one-way delay each,
-#   so RTT = 2x the profile delay). GSO disabled via ethtool (WSL2 veth bug).
-#
-# Runs from repo root:   sudo bash run_tls_baseline.sh [channel]   (default: leo)
-#
-# For each channel it does two passes:
-#   * resume pass   — 0-RTT allowed (best-case TLS)
-#   * noresume pass — full 1-RTT every reconnect (RFC 8446 ticket-expiry case)
-# Output: JSONL under ./tls-baseline-results/<timestamp>/
+#!/usr/bin/bash
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -21,7 +8,7 @@ BIN="./target/release/tls-baseline"
 
 # Per-channel reconnect count. Mars/Lunar are deliberately small: on the baseline
 # EVERY reconnect is a real handshake at the channel RTT, so a few give a clean mean
-# without an overnight wait (Mars RTT ~= 480s).
+# without an overnight wait.
 case "$CHANNEL" in
   leo|geo)   RECONNECTS="${RECONNECTS:-16}" ;;
   lunar)     RECONNECTS="${RECONNECTS:-6}"  ;;

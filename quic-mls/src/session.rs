@@ -1,3 +1,15 @@
+//Note:
+// Implements quinn-proto's crypto::Session trait, substituting MLS-derived
+// key material for the TLS 1.3 handshake at every point QUIC expects one.
+// References:
+//   RFC 9001 section 5.2 (Initial keys are unchanged from TLS/QUIC never MLS-derived).
+//     https://www.rfc-editor.org/rfc/rfc9001.html#name-initial-secrets
+//   RFC 9420 section 8.5 (Exporters — the MLS mechanism this project substitutes
+//   for TLS's exported keying material), IETF, 2023.
+//     https://www.rfc-editor.org/rfc/rfc9420.html#name-exporters
+//   quinn-proto crate docs, crypto::Session trait (the integration point).
+//     https://docs.rs/quinn-proto/latest/quinn_proto/crypto/trait.Session.html
+//======================================================================================================================
 use crate::group::ExportSecret;
 use crate::keys::{derive_initial_keys, derive_mls_keys};
 use quinn_proto::coding::Codec;
@@ -46,10 +58,6 @@ pub struct MlsSession {
     peer_params: Option<TransportParameters>,
     cached_peer_params: Option<TransportParameters>,
     key_update_generation: u64,
-    // Snapshotted lazily on the first `write_handshake` call (HsState::Initial),
-    // not at construction -- see the comment there for why that specific
-    // point in time is the one that satisfies both the reconnection fix and
-    // the pre-existing race regression test.
     pinned_zero_rtt_upgrade_keys: Option<Keys>,
     pinned_zero_rtt_keys: Option<Keys>,
 }

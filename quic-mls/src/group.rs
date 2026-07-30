@@ -1,3 +1,10 @@
+//Note:
+// Wraps mls_rs::Group's own commit/apply/export API behind the ExportSecret
+// trait; CommitLog adds checkpointed history on top for recovery.
+// Reference: mls-rs crate docs (Group::export_secret, commit_builder, 
+//   process_incoming_message).
+//   https://docs.rs/mls-rs/latest/mls_rs/
+//======================================================================================================================
 use std::{collections::BTreeMap, sync::{Arc, Mutex}};
 
 pub struct CommitLog<G: ExportSecret> {
@@ -13,11 +20,6 @@ pub trait ExportSecret: Send + Sync {
     fn apply_commit(&mut self, commit: &[u8]) -> Result<(), mls_rs::error::MlsError>;
     fn create_commit(&mut self) -> Result<Vec<u8>, mls_rs::error::MlsError>;
 
-    // The commit-transcript window a sender would embed in its next
-    // handshake (Fig. 2's `ast'`). Default empty: a plain `Group` (e.g. Bob,
-    // who never originates commits in this testbed) has nothing to offer.
-    // Only `CommitLog` overrides this with its real, checkpoint-bounded
-    // window.
     fn pending_commit_window(&self) -> Vec<(u64, Vec<u8>)> {
         Vec::new()
     }
@@ -133,9 +135,9 @@ impl<G: ExportSecret> CommitLog<G> {
 /// Error returned by [`apply_commit_window`].
 #[derive(Debug)]
 pub enum CommitWindowError {
-    /// Gap in received epochs — the peer fell off the back of the sender's commit log.
+    /// Gap in received epochs  the peer fell off the back of the sender's commit log.
     ResyncNeeded,
-    /// The MLS library rejected the commit (e.g. corrupted bytes under packet loss).
+    /// The MLS library rejected the commit .
     MlsError(mls_rs::error::MlsError),
 }
 
