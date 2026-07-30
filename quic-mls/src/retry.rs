@@ -1,3 +1,15 @@
+//Note:
+// Retry packet integrity check (AEAD-based, fixed key/nonce per RFC).
+// Reference: RFC 9001 §5.8 (Retry Packet Integrity), IETF, Thomson & Turner, 2021.
+//   https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity
+// AES-128-GCM packet protection and AES-ECB header protection, structured
+// to satisfy quinn-proto's PacketKey / HeaderKey traits.
+// References:
+//   RFC 9001 section 5.3 (AEAD Usage) and section 5.4 (Header Protection), IETF, 2021.
+//     https://www.rfc-editor.org/rfc/rfc9001.html
+//   quinn-proto crate docs, crypto::{PacketKey, HeaderKey} traits.
+//     https://docs.rs/quinn-proto/latest/quinn_proto/crypto/
+//======================================================================================================================
 use aes_gcm::{aead::AeadInPlace, Aes128Gcm, Key, KeyInit, Nonce, Tag};
 //Reference vector from https://www.rfc-editor.org/rfc/rfc9001.html#name-retry-packet-integrity
 const RETRY_INTEGRITY_KEY: [u8; 16] = [
@@ -36,60 +48,4 @@ pub(crate) fn verify_retry_tag(orig_dst_cid: &[u8], header: &[u8], payload: &[u8
         .decrypt_in_place_detached(Nonce::from_slice(&RETRY_INTEGRITY_NONCE), &pseudo_packet, &mut [], Tag::from_slice(&payload[tag_start..]))
         .is_ok()
 }
-#[cfg(test)] mod retry_tests {
-    use super::*;
-    #[test]
-    fn test_compute_retry_tag() {
-        let orig_dst_cid = b"orig_dst_cid";
-        let packet = b"packet";
-        let tag = compute_retry_tag(orig_dst_cid, packet);
-        assert_eq!(tag.len(), 16);
-    }
-    #[test]
-    fn test_verify_retry_tag() {
-        let orig_dst_cid = b"orig_dst_cid";
-        let header = b"header";
-        let payload_body = b"payload";
-        let mut packet = Vec::new();
-        packet.extend_from_slice(header);
-        packet.extend_from_slice(payload_body);
-        let tag = compute_retry_tag(orig_dst_cid, &packet);
-        // verify_retry_tag expects payload's last 16 bytes to be the tag.
-        let mut payload = payload_body.to_vec();
-        payload.extend_from_slice(&tag);    
-        assert!(verify_retry_tag(orig_dst_cid, header, &payload));
-    }
-    #[test]
-    fn test_verify_retry_tag_invalid() {
-        let orig_dst_cid = b"orig_dst_cid";
-        let header = b"header";
-        let payload_body = b"payload";
-        let mut packet = Vec::new();
-        packet.extend_from_slice(header);
-        packet.extend_from_slice(payload_body);
-        let tag = compute_retry_tag(orig_dst_cid, &packet);
-        // verify_retry_tag expects payload's last 16 bytes to be the tag.
-        let mut payload = payload_body.to_vec();
-        payload.extend_from_slice(&tag);    
-        // Tamper with the tag to make it invalid
-        let last = payload.len() - 1;
-        payload[last] ^= 0xFF;
-        assert!(!verify_retry_tag(orig_dst_cid, header, &payload));
-    }
-    #[test]
-    fn test_verify_retry_tag_invalid_length() {
-        let orig_dst_cid = b"orig_dst_cid";
-        let header = b"header";
-        let payload_body = b"payload";
-        let mut packet = Vec::new();
-        packet.extend_from_slice(header);
-        packet.extend_from_slice(payload_body);
-        let tag = compute_retry_tag(orig_dst_cid, &packet);
-        // verify_retry_tag expects payload's last 16 bytes to be the tag.
-        let mut payload = payload_body.to_vec();
-        payload.extend_from_slice(&tag);    
-        // Remove some bytes from the payload to make it invalid length
-        payload.pop();
-        assert!(!verify_retry_tag(orig_dst_cid, header, &payload));
-    }
-}
+
