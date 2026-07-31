@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-quic-mls                 = { path = "../quic-mls" }
+quic-mls                 = { path = "../../../quic-mls" }
 quinn                    = { workspace = true }
 tokio                    = { workspace = true }
 thiserror                = { workspace = true }
