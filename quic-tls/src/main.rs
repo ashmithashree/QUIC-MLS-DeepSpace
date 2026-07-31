@@ -192,6 +192,9 @@ async fn run_client(
             iteration: i, handshake_ms: ms, setup_tx_bytes: tx, setup_rx_bytes: rx,
             crypto_frames_tx: ctx, crypto_frames_rx: crx, mode, zero_rtt_accepted: zrtt,
         }.emit();
+         if !no_resumption {
+            tokio::time::sleep(Duration::from_millis(2 * rtt_ms + 2000)).await;
+        }
         conn.close(0u32.into(), b"reconnect-done");
     }
 
