@@ -1,0 +1,2 @@
+interval_s	missed_commits_est	embedded_bytes	transcript_truncated	reconnect_epoch_matched	recovery_flush_bytes	verdict
+5	3	15	no	yes	NONE	LIVELOCK-SUSPECT

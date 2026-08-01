@@ -6,7 +6,7 @@ BIN="./target/release/tls-baseline"
 case "$CHANNEL" in
   leo|geo) RECONNECTS="${RECONNECTS:-16}"; IDLE=30 ;;
   lunar)   RECONNECTS="${RECONNECTS:-6}";  IDLE=60 ;;
-  mars)    RECONNECTS="${RECONNECTS:-1}";  IDLE=1500 ;;
+  mars)    RECONNECTS="${RECONNECTS:-1}";  IDLE=3600 ;;
   *) echo "unknown channel: $CHANNEL (use leo|geo|lunar|mars)"; exit 1 ;;
 esac
 BLACKOUT_MS="${BLACKOUT_MS:-0}"

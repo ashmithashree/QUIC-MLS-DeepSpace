@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 
 CHANNEL="mars"
 
-COMMIT_INTERVALS=(1 3 5 10)
+COMMIT_INTERVALS=(5)
 BLACKOUT_ON=15
 BLACKOUT_OFF=10
 REPORT_TIMEOUT=900
@@ -75,7 +75,7 @@ for INTERVAL in "${COMMIT_INTERVALS[@]}"; do
 
     BOB_CMD=(sudo timeout --foreground "${HARD_TIMEOUT}s"
         ip netns exec ns-bob env RUST_LOG=info,quic_mls=debug,testbed_runner=debug
-        ./target/release/testbed-runner
+        ../../target/release/testbed-runner
         --role bob --bind 10.200.1.2:5000
         --bootstrap-dir "$BOOTSTRAP"
         --commit-interval-secs "$INTERVAL" --duration-secs "$DURATION"
@@ -89,7 +89,7 @@ for INTERVAL in "${COMMIT_INTERVALS[@]}"; do
 
     ALICE_CMD=(sudo timeout --foreground "${HARD_TIMEOUT}s"
         ip netns exec ns-alice env RUST_LOG=info,quic_mls=debug,testbed_runner=debug
-        ./target/release/testbed-runner
+        ../../target/release/testbed-runner
         --role alice --bind 10.200.1.1:5001 --peer 10.200.1.2:5000
         --bootstrap-dir "$BOOTSTRAP"
         --commit-interval-secs "$INTERVAL" --duration-secs "$DURATION"

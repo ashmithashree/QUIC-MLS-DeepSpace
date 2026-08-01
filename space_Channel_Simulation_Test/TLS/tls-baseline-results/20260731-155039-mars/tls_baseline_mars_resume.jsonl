@@ -1,0 +1,2 @@
+{"role":"client","phase":"initial_handshake","channel":"mars","rtt_ms":240000,"iteration":0,"handshake_ms":480143.028522,"setup_tx_bytes":25326,"setup_rx_bytes":2452,"crypto_frames_tx":19,"crypto_frames_rx":3,"mode":"full-1rtt","zero_rtt_accepted":false}
+{"role":"client","phase":"reconnect","channel":"mars","rtt_ms":240000,"iteration":1,"handshake_ms":480084.502448,"setup_tx_bytes":25326,"setup_rx_bytes":2452,"crypto_frames_tx":19,"crypto_frames_rx":3,"mode":"full-1rtt","zero_rtt_accepted":false}
