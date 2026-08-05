@@ -20,7 +20,7 @@ echo
 echo "=== 1. Build once ==="
 cargo build --release 2>&1 | tail -30
 
-RESULTS_DIR="./sweep-results-mars/$(date +%Y%m%d-%H%M%S)"
+RESULTS_DIR="../../results/sweep-results-mars/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 echo ""
 echo ">>> RESULTS_DIR = $RESULTS_DIR   <<<  (relative to repo root, NOT /tmp)"

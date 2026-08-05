@@ -31,7 +31,7 @@ echo
 echo "=== 1. Build once ==="
 cargo build --release 2>&1 | tail -30
 
-RESULTS_DIR="./sweep-results-geo/$(date +%Y%m%d-%H%M%S)"
+RESULTS_DIR="../../results/sweep-results-geo/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$RESULTS_DIR"
 echo ""
 echo ">>> RESULTS_DIR = $RESULTS_DIR   <<<  (relative to repo root, NOT /tmp)"
@@ -85,7 +85,7 @@ for INTERVAL in "${COMMIT_INTERVALS[@]}"; do
 
     BOB_CMD=(sudo timeout --foreground "${HARD_TIMEOUT}s"
         ip netns exec ns-bob env RUST_LOG=info,quic_mls=debug,testbed_runner=debug
-        ./target/release/testbed-runner
+        ../../target/release/testbed-runner
         --role bob --bind 10.200.1.2:5000
         --bootstrap-dir "$BOOTSTRAP"
         --commit-interval-secs "$INTERVAL" --duration-secs "$DURATION"
@@ -99,7 +99,7 @@ for INTERVAL in "${COMMIT_INTERVALS[@]}"; do
 
     ALICE_CMD=(sudo timeout --foreground "${HARD_TIMEOUT}s"
         ip netns exec ns-alice env RUST_LOG=info,quic_mls=debug,testbed_runner=debug
-        ./target/release/testbed-runner
+        ../../target/release/testbed-runner
         --role alice --bind 10.200.1.1:5001 --peer 10.200.1.2:5000
         --bootstrap-dir "$BOOTSTRAP"
         --commit-interval-secs "$INTERVAL" --duration-secs "$DURATION"
