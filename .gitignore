@@ -5,3 +5,4 @@ key.pub
 build.log
 runsteady.sh
 **/target/
+results/excluded-runs/
