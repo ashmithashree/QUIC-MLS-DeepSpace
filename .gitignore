@@ -4,3 +4,4 @@ key
 key.pub
 build.log
 runsteady.sh
+**/target/
